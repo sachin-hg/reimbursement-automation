@@ -64,10 +64,6 @@ app.get('/api/events', (req, res) => {
   res.on('close', () => clearInterval(hb));
 });
 
-// ── Session config (in-memory, not persisted — overrides .env for this server process) ──
-
-let sessionConfig = {};
-
 // ── Run state ─────────────────────────────────────────────────────────────────
 
 let currentRun = null;
@@ -137,36 +133,25 @@ function getRunState() {
 
 app.get('/api/status', (req, res) => res.json({ run: getRunState() }));
 
-// Get current effective config (sensitive fields masked to "***" or "")
+// Report which env vars are set — UI uses this to show "configured in .env" hints.
+// Never returns actual values for sensitive fields.
 app.get('/api/config', (req, res) => {
-  const cfg = resolveConfig(sessionConfig);
   const SENSITIVE = new Set(['PORTAL_PASSWORD', 'ANTHROPIC_API_KEY']);
+  const KEYS = ['ANTHROPIC_API_KEY', 'PORTAL_USERNAME', 'PORTAL_PASSWORD',
+                'HEADLESS', 'GMAIL_ADDRESS', 'SENDER_EMAIL', 'GMAIL_LABEL', 'LOOKBACK_DAYS'];
   const result = {};
-  for (const [k, v] of Object.entries(cfg)) {
-    result[k] = SENSITIVE.has(k) ? (v ? '***' : '') : v;
-  }
-  // Tell the UI which fields have values from .env only (not from a UI override)
-  result._fromEnv = Object.keys(cfg).filter(
-    k => !sessionConfig[k] && process.env[k]
-  );
-  res.json(result);
-});
-
-// Update session config — empty string clears an override (falls back to .env)
-app.put('/api/config', (req, res) => {
-  const ALLOWED = ['ANTHROPIC_API_KEY', 'PORTAL_USERNAME', 'PORTAL_PASSWORD',
-                   'HEADLESS', 'GMAIL_ADDRESS', 'SENDER_EMAIL', 'GMAIL_LABEL', 'LOOKBACK_DAYS'];
-  for (const key of ALLOWED) {
-    if (req.body[key] !== undefined) {
-      const v = req.body[key];
-      if (v === '' || v === null) {
-        delete sessionConfig[key]; // clear override → fall back to .env
-      } else {
-        sessionConfig[key] = v;
-      }
+  for (const k of KEYS) {
+    if (SENSITIVE.has(k)) {
+      result[k] = !!process.env[k];  // boolean: is it set in .env?
+    } else if (k === 'HEADLESS') {
+      result[k] = process.env[k] !== undefined ? process.env[k] !== 'false' : null;
+    } else if (k === 'LOOKBACK_DAYS') {
+      result[k] = process.env[k] ? parseInt(process.env[k], 10) : null;
+    } else {
+      result[k] = process.env[k] || null;
     }
   }
-  res.json({ ok: true });
+  res.json(result);
 });
 
 // Load images from local folder
@@ -246,6 +231,8 @@ app.post('/api/upload', upload.array('images'), (req, res) => {
 app.post('/api/crop', async (req, res) => {
   if (!currentRun) return res.status(400).json({ error: 'No active run' });
   if (currentRun.status === 'cropping') return res.status(409).json({ error: 'Already cropping' });
+  const { config: clientConfig = {} } = req.body || {};
+  const apiKey = resolveConfig(clientConfig).ANTHROPIC_API_KEY;
 
   res.json({ ok: true });
   currentRun.status = 'cropping';
@@ -255,7 +242,7 @@ app.post('/api/crop', async (req, res) => {
   for (let i = 0; i < total; i++) {
     const att = currentRun.attachments[i];
     try {
-      const croppedPath = await smartCrop(att.path, null, { apiKey: resolveConfig(sessionConfig).ANTHROPIC_API_KEY });
+      const croppedPath = await smartCrop(att.path, null, { apiKey });
       const prepared = { ...att, croppedPath, cropStatus: 'done' };
       currentRun.prepared.push(prepared);
       broadcast('crop_progress', {
@@ -277,14 +264,14 @@ app.post('/api/crop', async (req, res) => {
 
 // AI re-crop single image with optional text feedback
 app.post('/api/recrop', async (req, res) => {
-  const { id, feedback } = req.body;
+  const { id, feedback, config: clientConfig = {} } = req.body;
   if (!currentRun) return res.status(400).json({ error: 'No active run' });
 
   const att = currentRun.attachments.find(a => a.id === id);
   if (!att) return res.status(404).json({ error: 'Image not found' });
 
   try {
-    const croppedPath = await smartCrop(att.path, feedback || null, { apiKey: resolveConfig(sessionConfig).ANTHROPIC_API_KEY });
+    const croppedPath = await smartCrop(att.path, feedback || null, { apiKey: resolveConfig(clientConfig).ANTHROPIC_API_KEY });
     const croppedUrl  = fileUrl(croppedPath);
 
     const idx = currentRun.prepared?.findIndex(p => p.id === id);
@@ -338,7 +325,7 @@ app.post('/api/manualcrop', async (req, res) => {
 
 // Extract bill data — mode: 'ocr' (default, fast) or 'llm' (vision, accurate)
 app.post('/api/extract', async (req, res) => {
-  const { approvedIds, mode = 'ocr' } = req.body;
+  const { approvedIds, mode = 'ocr', config: clientConfig = {} } = req.body;
   if (!currentRun) return res.status(400).json({ error: 'No active run' });
   if (!Array.isArray(approvedIds) || !approvedIds.length)
     return res.status(400).json({ error: 'approvedIds must be a non-empty array' });
@@ -356,7 +343,7 @@ app.post('/api/extract', async (req, res) => {
     async function processOne(att) {
       const croppedUrl = fileUrl(att.croppedPath) + (att.cropTime ? `?t=${att.cropTime}` : '');
       try {
-        const data = await extractBillData(att.croppedPath, { apiKey: resolveConfig(sessionConfig).ANTHROPIC_API_KEY });
+        const data = await extractBillData(att.croppedPath, { apiKey: resolveConfig(clientConfig).ANTHROPIC_API_KEY });
         if (data) {
           bills.push({ ...data, id: att.id, imagePath: att.croppedPath, filename: att.filename, cropTime: att.cropTime ?? null });
           broadcast('extract_result', { id: att.id, type: 'bill', ...data, croppedUrl, filename: att.filename });
@@ -402,7 +389,7 @@ app.post('/api/extract', async (req, res) => {
 
     // Phase 2: batch Claude extraction
     broadcast('extract_progress', { done: 0, total, phase: 'claude' });
-    const result = await extractFromOCR(ocrResults, toProcess, { autoMode: false, apiKey: resolveConfig(sessionConfig).ANTHROPIC_API_KEY });
+    const result = await extractFromOCR(ocrResults, toProcess, { autoMode: false, apiKey: resolveConfig(clientConfig).ANTHROPIC_API_KEY });
 
     for (const b of result.bills) {
       const att = toProcess.find(p => p.id === b.id);
@@ -449,14 +436,14 @@ app.post('/api/extract', async (req, res) => {
 
 // Re-extract a single bill using LLM vision (called from Step 3 review)
 app.post('/api/reextract', async (req, res) => {
-  const { id } = req.body;
+  const { id, config: clientConfig = {} } = req.body;
   if (!currentRun) return res.status(400).json({ error: 'No active run' });
 
   const att = (currentRun.prepared || []).find(p => p.id === id);
   if (!att) return res.status(404).json({ error: 'Image not found' });
 
   try {
-    const data = await extractBillData(att.croppedPath, { apiKey: resolveConfig(sessionConfig).ANTHROPIC_API_KEY });
+    const data = await extractBillData(att.croppedPath, { apiKey: resolveConfig(clientConfig).ANTHROPIC_API_KEY });
     if (!data) return res.json({ id, found: false });
 
     // Update in-memory bills list
@@ -502,7 +489,7 @@ app.put('/api/bills', (req, res) => {
 
 // Submit to portal — async
 app.post('/api/submit', async (req, res) => {
-  const { bills: edited } = req.body;
+  const { bills: edited, config: clientConfig = {} } = req.body;
   if (!currentRun) return res.status(400).json({ error: 'No active run' });
   if (!Array.isArray(edited) || !edited.length)
     return res.status(400).json({ error: 'bills must be a non-empty array' });
@@ -541,7 +528,7 @@ app.post('/api/submit', async (req, res) => {
       signal: killController.signal,
       waitIfPaused,
       waitForConfirm,
-      config: sessionConfig,
+      config: clientConfig,
     });
     currentRun.result = result;
     currentRun.status = result.success ? 'done' : 'error';
