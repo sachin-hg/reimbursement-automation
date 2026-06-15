@@ -6,7 +6,7 @@ const fs = require('fs');
 const sharp = require('sharp');
 const { smartCrop } = require('./image-processor');
 const { extractBillData } = require('./bill-extractor');
-const { extractAllBillsOCR } = require('./ocr-extractor');
+const { ocrAllImages, extractFromOCR, LOW_CONFIDENCE_THRESHOLD } = require('./ocr-extractor');
 const { submitReimbursementClaims } = require('./portal');
 const logger = require('./logger');
 
@@ -72,6 +72,8 @@ function serializePrepared(p) {
     originalUrl: fileUrl(p.path),
     croppedUrl: fileUrl(p.croppedPath),
     cropStatus: p.cropStatus || 'done',
+    ocrConfidence: p.ocrConfidence ?? null,  // 0-100, null if not yet scanned
+    ocrText: p.ocrText ?? null,
   };
 }
 
@@ -209,6 +211,20 @@ app.post('/api/crop', async (req, res) => {
     }
   }
 
+  // Run OCR on all cropped images so confidence scores are ready before extraction
+  currentRun.status = 'ocr_scanning';
+  broadcast('ocr_start', { total: currentRun.prepared.length });
+  try {
+    const ocrResults = await ocrAllImages(currentRun.prepared);
+    for (const r of ocrResults) {
+      const p = currentRun.prepared.find(x => x.id === r.id);
+      if (p) { p.ocrConfidence = r.confidence; p.ocrText = r.text; }
+    }
+    broadcast('ocr_complete', { scores: ocrResults.map(r => ({ id: r.id, confidence: r.confidence })) });
+  } catch (err) {
+    logger.warn(`OCR scan failed: ${err.message}`);
+  }
+
   currentRun.status = 'crop_done';
   broadcast('crop_complete', { prepared: currentRun.prepared.map(serializePrepared) });
 });
@@ -272,9 +288,9 @@ app.post('/api/manualcrop', async (req, res) => {
   }
 });
 
-// Extract bill data from approved images — async, streams via SSE
+// Extract bill data — mode: 'ocr' (default, fast) or 'llm' (vision, accurate)
 app.post('/api/extract', async (req, res) => {
-  const { approvedIds } = req.body;
+  const { approvedIds, mode = 'ocr' } = req.body;
   if (!currentRun) return res.status(400).json({ error: 'No active run' });
   if (!Array.isArray(approvedIds) || !approvedIds.length)
     return res.status(400).json({ error: 'approvedIds must be a non-empty array' });
@@ -284,36 +300,61 @@ app.post('/api/extract', async (req, res) => {
 
   const toProcess = (currentRun.prepared || []).filter(p => approvedIds.includes(p.id));
   const total = toProcess.length;
+  const bills = [], skipped = [];
 
-  // Signal that OCR + batch extraction is running
-  broadcast('extract_progress', { done: 0, total, phase: 'ocr' });
+  if (mode === 'llm') {
+    // ── LLM vision mode: 4-concurrent Claude Vision calls ──────────────────
+    const CONCURRENCY = 4;
+    async function processOne(att) {
+      const croppedUrl = fileUrl(att.croppedPath) + (att.cropTime ? `?t=${att.cropTime}` : '');
+      try {
+        const data = await extractBillData(att.croppedPath);
+        if (data) {
+          bills.push({ ...data, id: att.id, imagePath: att.croppedPath, filename: att.filename });
+          broadcast('extract_result', { id: att.id, type: 'bill', ...data, croppedUrl, filename: att.filename });
+        } else {
+          skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath });
+          broadcast('extract_result', { id: att.id, type: 'skipped', croppedUrl, filename: att.filename });
+        }
+      } catch (err) {
+        logger.error(`Extract ${att.filename}: ${err.message}`);
+        skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath, error: err.message });
+        broadcast('extract_result', { id: att.id, type: 'skipped', croppedUrl, filename: att.filename, error: err.message });
+      }
+      broadcast('extract_progress', { done: bills.length + skipped.length, total });
+    }
+    for (let i = 0; i < toProcess.length; i += CONCURRENCY) {
+      await Promise.all(toProcess.slice(i, i + CONCURRENCY).map(processOne));
+    }
 
-  let extractedBills = [];
-  try {
-    extractedBills = await extractAllBillsOCR(toProcess);
-  } catch (err) {
-    logger.error(`Batch OCR extraction failed: ${err.message}`);
+  } else {
+    // ── OCR mode: batch text + single Claude call ───────────────────────────
+    // Use pre-computed OCR from crop phase; fall back to fresh OCR if missing
+    const ocrResults = toProcess.map(att => ({
+      id: att.id,
+      text: att.ocrText || '',
+      confidence: att.ocrConfidence ?? 0,
+      ocrOk: (att.ocrText || '').length >= 40,
+    }));
+
+    broadcast('extract_progress', { done: 0, total });
+    const result = await extractFromOCR(ocrResults, toProcess, { autoMode: false });
+    bills.push(...result.bills);
+    skipped.push(...result.skipped);
+
+    for (const b of bills) {
+      const att = toProcess.find(p => p.id === b.id);
+      const croppedUrl = fileUrl(b.imagePath) + (att?.cropTime ? `?t=${att.cropTime}` : '');
+      broadcast('extract_result', { id: b.id, type: 'bill', bill_no: b.bill_no, bill_date: b.bill_date,
+        bill_amount: b.bill_amount, croppedUrl, filename: b.filename });
+    }
+    for (const s of skipped) {
+      const att = toProcess.find(p => p.id === s.id);
+      const croppedUrl = fileUrl(s.croppedPath || '') + (att?.cropTime ? `?t=${att.cropTime}` : '');
+      broadcast('extract_result', { id: s.id, type: 'skipped', croppedUrl, filename: s.filename, error: s.error });
+    }
+    broadcast('extract_progress', { done: total, total });
   }
-
-  // Build bills/skipped by diffing against toProcess
-  const extractedIds = new Set(extractedBills.map(b => b.id));
-  const bills   = extractedBills;
-  const skipped = toProcess
-    .filter(p => !extractedIds.has(p.id))
-    .map(p => ({ id: p.id, filename: p.filename, croppedPath: p.croppedPath }));
-
-  // Broadcast individual results so UI updates incrementally
-  for (const b of bills) {
-    const croppedUrl = fileUrl(b.imagePath) + (toProcess.find(p => p.id === b.id)?.cropTime ? `?t=${toProcess.find(p => p.id === b.id).cropTime}` : '');
-    broadcast('extract_result', { id: b.id, type: 'bill', bill_no: b.bill_no, bill_date: b.bill_date, bill_amount: b.bill_amount, croppedUrl, filename: b.filename });
-  }
-  for (const s of skipped) {
-    const att = toProcess.find(p => p.id === s.id);
-    const croppedUrl = fileUrl(s.croppedPath) + (att?.cropTime ? `?t=${att.cropTime}` : '');
-    broadcast('extract_result', { id: s.id, type: 'skipped', croppedUrl, filename: s.filename });
-  }
-
-  broadcast('extract_progress', { done: total, total });
 
   currentRun.bills   = bills;
   currentRun.skipped = skipped;
@@ -322,6 +363,34 @@ app.post('/api/extract', async (req, res) => {
     bills: bills.map(serializeBill),
     skipped: skipped.map(serializeSkipped),
   });
+});
+
+// Re-extract a single bill using LLM vision (called from Step 3 review)
+app.post('/api/reextract', async (req, res) => {
+  const { id } = req.body;
+  if (!currentRun) return res.status(400).json({ error: 'No active run' });
+
+  const att = (currentRun.prepared || []).find(p => p.id === id);
+  if (!att) return res.status(404).json({ error: 'Image not found' });
+
+  try {
+    const data = await extractBillData(att.croppedPath);
+    if (!data) return res.json({ id, found: false });
+
+    // Update in-memory bills list
+    const existing = currentRun.bills?.find(b => b.id === id);
+    if (existing) {
+      Object.assign(existing, data);
+    } else {
+      currentRun.bills = currentRun.bills || [];
+      currentRun.bills.push({ ...data, id, imagePath: att.croppedPath, filename: att.filename });
+      currentRun.skipped = (currentRun.skipped || []).filter(s => s.id !== id);
+    }
+
+    res.json({ id, found: true, bill_no: data.bill_no, bill_date: data.bill_date, bill_amount: data.bill_amount });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Submit to portal — async

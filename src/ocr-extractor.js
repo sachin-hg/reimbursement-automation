@@ -7,14 +7,13 @@ const fs = require('fs');
 const { createWorker } = require('tesseract.js');
 const logger = require('./logger');
 
-// Images whose OCR text scores below this threshold fall back to vision
-const OCR_QUALITY_THRESHOLD = 80;
-
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ── OCR ───────────────────────────────────────────────────────────────────────
-// Pre-process with Sharp (greyscale + contrast) then run Tesseract.
-// Returns raw extracted text, or empty string if unreadable.
+// Images with Tesseract mean-word confidence below this are flagged low-confidence.
+// In auto mode these are skipped; in human mode they're sorted to the top for review.
+const LOW_CONFIDENCE_THRESHOLD = 55;
+
+// ── Tesseract worker (singleton, reused across calls) ─────────────────────────
 
 let _worker = null;
 
@@ -25,92 +24,107 @@ async function getWorker() {
   return _worker;
 }
 
+// ── OCR one image ─────────────────────────────────────────────────────────────
+// Pre-processes with Sharp (greyscale + normalize + sharpen) for better accuracy.
+// Returns { text, confidence } where confidence is 0-100 (Tesseract mean word confidence).
+
 async function ocrImage(imagePath) {
-  // Pre-process: greyscale, normalize contrast, scale up to ~1200px wide
   const meta = await sharp(imagePath, { failOn: 'none' }).metadata();
   const targetW = Math.max(1200, meta.width || 1200);
 
-  const tmpPath = path.join(os.tmpdir(), `ocr_${path.basename(imagePath)}_${Date.now()}.png`);
+  const tmpPath = path.join(os.tmpdir(), `ocr_${Date.now()}_${path.basename(imagePath)}.png`);
   await sharp(imagePath, { failOn: 'none' })
     .rotate()
     .resize(targetW, null, { withoutEnlargement: false })
     .greyscale()
-    .normalise()           // auto stretch contrast
+    .normalise()
     .sharpen({ sigma: 1 })
     .png()
     .toFile(tmpPath);
 
   try {
     const worker = await getWorker();
-    const { data: { text } } = await worker.recognize(tmpPath);
-    return text.trim();
+    const { data } = await worker.recognize(tmpPath);
+    const words = data.words || [];
+    const confidence = words.length
+      ? Math.round(words.reduce((s, w) => s + w.confidence, 0) / words.length)
+      : 0;
+    return { text: data.text.trim(), confidence };
   } finally {
     fs.unlink(tmpPath, () => {});
   }
 }
 
-// ── Batch LLM extraction ──────────────────────────────────────────────────────
-// Send all OCR texts in a single Claude call. Much cheaper than sending images.
+// ── Step 1: OCR all images (no Claude call) ───────────────────────────────────
+// Called during crop review so confidence scores are ready before extraction.
 
-async function extractAllBillsOCR(preparedAttachments) {
-  const results = [];
-
-  // 1. OCR all images in parallel
-  logger.info(`OCR: processing ${preparedAttachments.length} images…`);
-  const ocrResults = await Promise.all(
+async function ocrAllImages(preparedAttachments) {
+  logger.info(`OCR scanning ${preparedAttachments.length} images for confidence scores…`);
+  const results = await Promise.all(
     preparedAttachments.map(async att => {
       try {
-        const text = await ocrImage(att.croppedPath);
-        logger.info(`  OCR ${att.filename}: ${text.length} chars`);
-        return { att, text };
+        const { text, confidence } = await ocrImage(att.croppedPath);
+        logger.info(`  OCR ${att.filename}: ${text.length} chars, confidence ${confidence}`);
+        return { id: att.id, text, confidence, ocrOk: text.length >= 40 };
       } catch (err) {
         logger.warn(`  OCR failed ${att.filename}: ${err.message}`);
-        return { att, text: '' };
+        return { id: att.id, text: '', confidence: 0, ocrOk: false };
       }
     })
   );
+  return results; // [{ id, text, confidence, ocrOk }]
+}
 
-  // 2. Split: good OCR → batch text call; poor OCR → vision fallback
-  const readable   = ocrResults.filter(r => r.text.length >= OCR_QUALITY_THRESHOLD);
-  const needVision = ocrResults.filter(r => r.text.length <  OCR_QUALITY_THRESHOLD);
+// ── Step 2: Batch Claude text extraction ──────────────────────────────────────
+// Takes OCR results + prepared attachments; sends all texts in one Claude call.
+// For low-confidence or blank OCR, falls back to individual vision calls.
 
-  needVision.forEach(r => logger.warn(`  Poor OCR on ${r.att.filename} (${r.text.length} chars) — falling back to vision`));
+async function extractFromOCR(ocrResults, preparedAttachments, { autoMode = false } = {}) {
+  const attById = Object.fromEntries(preparedAttachments.map(a => [a.id, a]));
 
-  if (!readable.length) {
-    logger.warn('No readable images after OCR');
-    return [];
+  // In auto mode: skip low-confidence results entirely (don't even vision-fallback)
+  // In human mode: vision-fallback for low-confidence so human can review/correct
+  const toExtract  = ocrResults.filter(r => r.ocrOk && (autoMode ? r.confidence >= LOW_CONFIDENCE_THRESHOLD : true));
+  const lowConf    = ocrResults.filter(r => r.ocrOk && !autoMode && r.confidence < LOW_CONFIDENCE_THRESHOLD);
+  const noText     = ocrResults.filter(r => !r.ocrOk);
+
+  if (autoMode) {
+    noText.concat(ocrResults.filter(r => r.ocrOk && r.confidence < LOW_CONFIDENCE_THRESHOLD))
+      .forEach(r => logger.warn(`  Auto-skip ${attById[r.id]?.filename}: low confidence (${r.confidence})`));
   }
 
-  // 3. Single Claude call with all OCR texts
-  const receiptBlocks = readable.map((r, i) =>
-    `RECEIPT ${r.att.id} (${r.att.filename}):\n${r.text}`
-  ).join('\n\n---\n\n');
+  const bills = [], skipped = [];
 
-  logger.info(`Sending ${readable.length} OCR texts to Claude in one call…`);
+  // ── Batch text call for good-OCR images ──────────────────────────────────
+  if (toExtract.length) {
+    const receiptBlocks = toExtract.map(r =>
+      `RECEIPT ${r.id} (${attById[r.id]?.filename}):\n${r.text}`
+    ).join('\n\n---\n\n');
 
-  let parsed;
-  try {
-    const response = await client.messages.create({
-      model: 'claude-sonnet-4-6',
-      max_tokens: 1024,
-      system: [
-        'You are an expert at parsing Indian petrol/fuel receipt text extracted by OCR.',
-        'OCR text may have noise, misrecognised characters, or missing spaces — use context to correct.',
-        'Always return valid JSON only — no markdown, no prose.',
-      ].join(' '),
-      messages: [{
-        role: 'user',
-        content: `Extract structured data from these OCR-scanned petrol receipts. For each receipt return an object in the JSON array.
+    logger.info(`Sending ${toExtract.length} OCR texts to Claude in one call…`);
+    let parsed = [];
+    try {
+      const response = await client.messages.create({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 1024,
+        system: [
+          'You are an expert at parsing Indian petrol/fuel receipt text extracted by OCR.',
+          'OCR text may have noise, misrecognised characters, or missing spaces — use context to correct.',
+          'Always return valid JSON only — no markdown, no prose.',
+        ].join(' '),
+        messages: [{
+          role: 'user',
+          content: `Extract structured data from these OCR-scanned petrol receipts.
 
 ${receiptBlocks}
 
-Return ONLY a JSON array (one object per receipt, in the same order):
+Return ONLY a JSON array (one object per receipt):
 [
   {
     "id": "<receipt id from the header>",
     "bill_no": "<invoice/receipt/slip/txn number — null if not found>",
     "bill_date": "<date as DD/MM/YYYY — null if not found>",
-    "bill_amount": <total amount paid as number — null if not found>,
+    "bill_amount": <total amount paid as a number — null if not found>,
     "valid": <true if all three fields present AND amount 400–5000 AND NOT clearly restaurant/grocery>,
     "skip_reason": "<brief reason if valid=false, else null>"
   }
@@ -120,74 +134,71 @@ Tips:
 - bill_no: "Invoice No", "INV NO", "Receipt No", "Slip No", "TXN NO", "APPR CODE"
 - bill_date: any date format → DD/MM/YYYY
 - bill_amount: "AMOUNT", "Total", "Rs.", "₹", "INR", "Sale", "BASE AMT" — keep decimals
-- Accept both fuel bills AND card machine receipts (Pine Labs, HDFC, etc.) from petrol stations`,
-      }],
-    });
+- Accept fuel bills AND card machine receipts (Pine Labs, HDFC, etc.) from petrol stations`,
+        }],
+      });
 
-    const raw = response.content[0].text.trim().replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
-    parsed = JSON.parse(raw.match(/\[[\s\S]*\]/)[0]);
-  } catch (err) {
-    logger.error(`Claude batch call failed: ${err.message}`);
-    return [];
+      const raw = response.content[0].text.trim().replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+      parsed = JSON.parse(raw.match(/\[[\s\S]*\]/)[0]);
+    } catch (err) {
+      logger.error(`Claude batch call failed: ${err.message}`);
+    }
+
+    for (const item of parsed) {
+      const att = attById[item.id];
+      if (!att) continue;
+      if (!item.valid || !item.bill_amount || item.bill_amount < 400 || item.bill_amount > 5000) {
+        logger.warn(`  Skipping ${att.filename}: ${item.skip_reason || 'invalid'}`);
+        skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath });
+        continue;
+      }
+      logger.info(`  ✓ No: ${item.bill_no} | Date: ${item.bill_date} | Amount: ₹${item.bill_amount}`);
+      bills.push({ id: att.id, filename: att.filename, imagePath: att.croppedPath,
+        bill_no: item.bill_no, bill_date: item.bill_date, bill_amount: item.bill_amount });
+    }
+
+    // Mark any IDs that came back from Claude but weren't in parsed (shouldn't happen)
+    const parsedIds = new Set(parsed.map(p => p.id));
+    for (const r of toExtract) {
+      if (!parsedIds.has(r.id) && !bills.find(b => b.id === r.id) && !skipped.find(s => s.id === r.id)) {
+        skipped.push({ id: r.id, filename: attById[r.id]?.filename, croppedPath: attById[r.id]?.croppedPath });
+      }
+    }
   }
 
-  // 4. Vision fallback for poor-OCR images (individual calls, already fast since few images)
-  if (needVision.length) {
-    logger.info(`Vision fallback for ${needVision.length} image(s)…`);
+  // ── Vision fallback for low-confidence OCR (human mode only) ─────────────
+  if (lowConf.length) {
+    logger.info(`Vision fallback for ${lowConf.length} low-confidence image(s)…`);
     const { extractBillData } = require('./bill-extractor');
-    const fallbackResults = await Promise.all(needVision.map(async r => {
+    await Promise.all(lowConf.map(async r => {
+      const att = attById[r.id];
       try {
-        const data = await extractBillData(r.att.croppedPath);
+        const data = await extractBillData(att.croppedPath);
         if (data) {
-          logger.info(`  ✓ Vision fallback ${r.att.filename}: ₹${data.bill_amount}`);
-          return { id: r.att.id, bill_no: data.bill_no, bill_date: data.bill_date, bill_amount: data.bill_amount, valid: true };
+          logger.info(`  ✓ Vision ${att.filename}: ₹${data.bill_amount}`);
+          bills.push({ id: att.id, filename: att.filename, imagePath: att.croppedPath, ...data });
+        } else {
+          skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath });
         }
       } catch (err) {
-        logger.warn(`  Vision fallback failed ${r.att.filename}: ${err.message}`);
+        logger.warn(`  Vision fallback failed ${att.filename}: ${err.message}`);
+        skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath, error: err.message });
       }
-      return null;
     }));
-
-    for (const item of fallbackResults) {
-      if (!item) continue;
-      const att = needVision.find(r => r.att.id === item.id)?.att;
-      if (att) parsed.push({ ...item, _fromVision: true });
-    }
   }
 
-  // 5. Map results back, log each
-  const idToAtt = Object.fromEntries([...readable, ...needVision].map(r => [r.att.id, r.att]));
-
-  for (const item of parsed) {
-    const att = idToAtt[item.id];
-    if (!att) continue;
-
-    if (!item.valid) {
-      logger.warn(`  Skipping ${att.filename}: ${item.skip_reason || 'marked invalid'}`);
-      continue;
-    }
-    if (!item.bill_amount || item.bill_amount < 400 || item.bill_amount > 5000) {
-      logger.warn(`  Skipping ${att.filename}: amount ₹${item.bill_amount} outside 400–5000`);
-      continue;
-    }
-
-    logger.info(`  ✓ No: ${item.bill_no} | Date: ${item.bill_date} | Amount: ₹${item.bill_amount}`);
-    results.push({
-      bill_no: item.bill_no,
-      bill_date: item.bill_date,
-      bill_amount: item.bill_amount,
-      valid: true,
-      imagePath: att.croppedPath,
-      filename: att.filename,
-      id: att.id,
-    });
+  // ── No-text images always go to skipped ──────────────────────────────────
+  for (const r of noText) {
+    const att = attById[r.id];
+    skipped.push({ id: r.id, filename: att?.filename, croppedPath: att?.croppedPath,
+      error: 'OCR returned no readable text' });
   }
 
-  return results;
+  return { bills, skipped };
 }
 
 async function terminateWorker() {
   if (_worker) { await _worker.terminate(); _worker = null; }
 }
 
-module.exports = { extractAllBillsOCR, ocrImage, terminateWorker };
+module.exports = { ocrAllImages, extractFromOCR, ocrImage, terminateWorker, LOW_CONFIDENCE_THRESHOLD };
