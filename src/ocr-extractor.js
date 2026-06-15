@@ -7,7 +7,9 @@ const fs = require('fs');
 const { createWorker } = require('tesseract.js');
 const logger = require('./logger');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+function getClient(apiKey) {
+  return new Anthropic({ apiKey: apiKey || process.env.ANTHROPIC_API_KEY });
+}
 
 // Images with Tesseract mean-word confidence below this are flagged low-confidence.
 // In auto mode these are skipped; in human mode they're sorted to the top for review.
@@ -149,7 +151,7 @@ async function ocrAllImages(preparedAttachments) {
 // Claude handles the noise — human reviews results and can re-extract with LLM.
 // In auto mode, low-confidence images are skipped entirely (no LLM fallback).
 
-async function extractFromOCR(ocrResults, preparedAttachments, { autoMode = false } = {}) {
+async function extractFromOCR(ocrResults, preparedAttachments, { autoMode = false, apiKey } = {}) {
   const attById = Object.fromEntries(preparedAttachments.map(a => [a.id, a]));
 
   // Auto mode: only process high-confidence images, skip the rest silently.
@@ -179,7 +181,7 @@ async function extractFromOCR(ocrResults, preparedAttachments, { autoMode = fals
     logger.info(`Sending ${toExtract.length} OCR texts to Claude (max_tokens=${maxTokens})…`);
     let parsed = [];
     try {
-      const response = await client.messages.create({
+      const response = await getClient(apiKey).messages.create({
         model: 'claude-sonnet-4-6',
         max_tokens: maxTokens,
         system: [
@@ -254,9 +256,9 @@ Tips:
 // ── Single-image Claude text extraction ───────────────────────────────────────
 // Used in the per-image streaming pipeline. Returns bill object or null.
 
-async function extractSingleFromText(ocrResult, att) {
+async function extractSingleFromText(ocrResult, att, apiKey) {
   try {
-    const response = await client.messages.create({
+    const response = await getClient(apiKey).messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 256,
       system: 'You are an expert at parsing Indian petrol/fuel receipt text extracted by OCR. OCR text may have noise — use context to correct. Return valid JSON only, no markdown.',

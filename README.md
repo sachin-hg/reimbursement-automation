@@ -14,7 +14,7 @@ Automates monthly petrol bill reimbursement claims against the Mynd Solutions pa
 
 ```
 Images (folder / Gmail)
-  └─ Smart crop — Claude Haiku detects receipt boundary, removes background
+  └─ Smart crop — CV pixel-density scan detects receipt boundary
       └─ OCR scan — Tesseract parallel scan, confidence score per image
           └─ Claude text extraction — batch call with all OCR text
              (low-confidence images fall back to Claude Vision)
@@ -147,15 +147,32 @@ node src/cli.js [options]
 
 ### Options
 
+**Source**
+
 | Flag | Short | Default | Description |
 |---|---|---|---|
 | `--folder <path>` | `-f` | — | Load images from a local folder instead of Gmail |
 | `--email <addr>` | `-e` | `GMAIL_ADDRESS` in `.env` | Gmail account to fetch bills from |
 | `--sender <addr>` | `-s` | `SENDER_EMAIL` in `.env` | Filter emails by sender address |
 | `--days <n>` | `-d` | `LOOKBACK_DAYS` (default 2) | Look back N days in Gmail |
+
+**Behaviour**
+
+| Flag | Short | Default | Description |
+|---|---|---|---|
 | `--mode <ocr\|llm>` | `-m` | `ocr` | Extraction mode: `ocr` (Tesseract + Claude text, faster) or `llm` (Claude Vision, more accurate on low-quality scans) |
 | `--human` | `-H` | off | Pause for `[y/N]` confirmation after each step |
 | `--help` | `-h` | — | Show help |
+
+**Config overrides** (all fall back to `.env` if not provided)
+
+| Flag | Short | Default | Description |
+|---|---|---|---|
+| `--api-key <key>` | `-k` | `ANTHROPIC_API_KEY` | Anthropic API key |
+| `--username <id>` | `-u` | `PORTAL_USERNAME` | Portal username / employee ID |
+| `--password <pwd>` | `-p` | `PORTAL_PASSWORD` | Portal password |
+| `--headless` / `--no-headless` | — | `HEADLESS` | Run browser headless or visible |
+| `--gmail-label <label>` | `-l` | `GMAIL_LABEL` | Gmail label to search |
 
 ### Examples
 
@@ -180,6 +197,15 @@ node src/cli.js --email you@gmail.com --days 5 --human
 
 # Fetch from Gmail — LLM mode, full human review
 node src/cli.js --email you@gmail.com --mode llm --human
+
+# Override credentials entirely (no .env needed)
+node src/cli.js --folder ~/bills --api-key sk-ant-... --username emp123 --password secret
+
+# Run headless (no visible browser window)
+node src/cli.js --folder ~/bills --headless
+
+# Use a different Gmail label
+node src/cli.js --email you@gmail.com --gmail-label "Fuel Bills"
 ```
 
 ### What `--human` does

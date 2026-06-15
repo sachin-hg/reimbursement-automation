@@ -5,6 +5,7 @@ const fs = require('fs');
 const readline = require('readline');
 const { execSync } = require('child_process');
 const logger = require('./logger');
+const { resolveConfig } = require('./config');
 const { fetchGmailAttachments } = require('./gmail-browser');
 const { prepareAllAttachments } = require('./image-processor');
 const { extractAllBills } = require('./bill-extractor');
@@ -19,38 +20,64 @@ const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.
 function parseArgs() {
   const args = process.argv.slice(2);
   const opts = {
-    email:  process.env.GMAIL_ADDRESS,
-    sender: process.env.SENDER_EMAIL || 'monika.aggarwal1992@gmail.com',
-    days:   parseInt(process.env.LOOKBACK_DAYS || '2', 10),
+    // Source
+    email:  null,
+    sender: null,
+    days:   null,
     folder: null,
+    // Behaviour
     human:  false,
-    mode:   'ocr',   // 'ocr' (default) | 'llm'
+    mode:   'ocr',
+    // Config overrides (all optional — fall back to .env)
+    apiKey:     null,
+    username:   null,
+    password:   null,
+    headless:   null,  // null = use .env; true/false = explicit override
+    gmailLabel: null,
   };
 
   for (let i = 0; i < args.length; i++) {
-    if      (args[i] === '--email'  || args[i] === '-e') opts.email  = args[++i];
-    else if (args[i] === '--sender' || args[i] === '-s') opts.sender = args[++i];
-    else if (args[i] === '--days'   || args[i] === '-d') opts.days   = parseInt(args[++i], 10);
-    else if (args[i] === '--folder' || args[i] === '-f') opts.folder = args[++i];
-    else if (args[i] === '--human'  || args[i] === '-H') opts.human  = true;
-    else if (args[i] === '--mode'   || args[i] === '-m') opts.mode   = args[++i];
-    else if (args[i] === '--help'   || args[i] === '-h') {
+    if      (args[i] === '--email'       || args[i] === '-e') opts.email      = args[++i];
+    else if (args[i] === '--sender'      || args[i] === '-s') opts.sender     = args[++i];
+    else if (args[i] === '--days'        || args[i] === '-d') opts.days       = parseInt(args[++i], 10);
+    else if (args[i] === '--folder'      || args[i] === '-f') opts.folder     = args[++i];
+    else if (args[i] === '--human'       || args[i] === '-H') opts.human      = true;
+    else if (args[i] === '--mode'        || args[i] === '-m') opts.mode       = args[++i];
+    else if (args[i] === '--api-key'     || args[i] === '-k') opts.apiKey     = args[++i];
+    else if (args[i] === '--username'    || args[i] === '-u') opts.username   = args[++i];
+    else if (args[i] === '--password'    || args[i] === '-p') opts.password   = args[++i];
+    else if (args[i] === '--headless')                        opts.headless   = true;
+    else if (args[i] === '--no-headless')                     opts.headless   = false;
+    else if (args[i] === '--gmail-label' || args[i] === '-l') opts.gmailLabel = args[++i];
+    else if (args[i] === '--help'        || args[i] === '-h') {
       console.log(`
 Usage: node src/cli.js [options]
 
-Options:
-  --email,  -e  <addr>      Gmail account to use (default: GMAIL_ADDRESS in .env)
-  --sender, -s  <addr>      Who to look for bills from (default: SENDER_EMAIL in .env)
-  --days,   -d  <n>         Look back N days in Gmail (default: 2)
-  --folder, -f  <path>      Use pre-downloaded images from this folder — skips Gmail
+Source:
+  --folder, -f  <path>      Load images from this folder — skips Gmail
+  --email,  -e  <addr>      Gmail account to fetch from (default: GMAIL_ADDRESS in .env)
+  --sender, -s  <addr>      Filter emails by sender (default: SENDER_EMAIL in .env)
+  --days,   -d  <n>         Look back N days in Gmail (default: LOOKBACK_DAYS in .env, or 2)
+
+Behaviour:
   --mode,   -m  <ocr|llm>   Extraction mode: ocr (default, faster) or llm (vision, accurate)
-  --human,  -H              Human-in-the-loop: pause for confirmation after each step
+  --human,  -H              Pause for confirmation after each step
+
+Config overrides (all fall back to .env if not provided):
+  --api-key,     -k  <key>  Anthropic API key
+  --username,    -u  <id>   Portal username / employee ID
+  --password,    -p  <pwd>  Portal password
+  --headless / --no-headless  Run browser headless (default: HEADLESS in .env, or false)
+  --gmail-label, -l  <lbl>  Gmail label to search (default: GMAIL_LABEL in .env, or "Petrol Bill")
+
   --help,   -h              Show this help
 
 Examples:
-  node src/cli.js --email a.sachin533@gmail.com --days 3
-  node src/cli.js --folder ~/Downloads/petrol-bills --human
-  node src/cli.js --folder ~/Downloads/petrol-bills --mode llm
+  node src/cli.js --folder ~/Downloads/petrol-bills
+  node src/cli.js --folder ~/Downloads/petrol-bills --human --mode llm
+  node src/cli.js --email you@gmail.com --days 3
+  node src/cli.js --email you@gmail.com --username emp123 --password secret --api-key sk-ant-...
+  node src/cli.js --folder ~/bills --headless
 `);
       process.exit(0);
     }
@@ -69,8 +96,14 @@ Examples:
     return opts;
   }
 
-  if (!opts.email)  { console.error('Error: Gmail address required. Pass --email <addr> or set GMAIL_ADDRESS in .env'); process.exit(1); }
-  if (!opts.sender) { console.error('Error: Sender email required. Pass --sender <addr> or set SENDER_EMAIL in .env');  process.exit(1); }
+  // Gmail mode — resolve email/sender from opts or env
+  const email  = opts.email  || process.env.GMAIL_ADDRESS;
+  const sender = opts.sender || process.env.SENDER_EMAIL;
+  if (!email)  { console.error('Error: Gmail address required. Pass --email <addr> or set GMAIL_ADDRESS in .env'); process.exit(1); }
+  if (!sender) { console.error('Error: Sender email required. Pass --sender <addr> or set SENDER_EMAIL in .env');  process.exit(1); }
+  opts.email  = email;
+  opts.sender = sender;
+  if (opts.days === null) opts.days = parseInt(process.env.LOOKBACK_DAYS || '2', 10);
   if (isNaN(opts.days) || opts.days < 1) { console.error('Error: --days must be a positive integer'); process.exit(1); }
 
   return opts;
@@ -123,7 +156,17 @@ function cliBroadcast(event, data) {
 // ── Main ───────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const { email: targetEmail, sender: senderEmail, days, folder, human, mode } = parseArgs();
+  const { email: targetEmail, sender: senderEmail, days, folder, human, mode,
+          apiKey, username, password, headless, gmailLabel } = parseArgs();
+
+  // Build CLI config overrides — only non-null values override .env
+  const cliOverrides = {};
+  if (apiKey   != null) cliOverrides.ANTHROPIC_API_KEY = apiKey;
+  if (username != null) cliOverrides.PORTAL_USERNAME   = username;
+  if (password != null) cliOverrides.PORTAL_PASSWORD   = password;
+  if (headless != null) cliOverrides.HEADLESS           = headless;
+  if (gmailLabel != null) cliOverrides.GMAIL_LABEL      = gmailLabel;
+  const cfg = resolveConfig(cliOverrides);
 
   const runId  = `run_${Date.now()}`;
   const runDir = path.join(DOWNLOADS_DIR, runId);
@@ -149,7 +192,7 @@ async function main() {
     logger.info(`  Time window   : last ${days} day(s)`);
     console.log('');
     logger.info('━━━ Step 1: Fetching Gmail attachments ━━━');
-    rawAttachments = await fetchGmailAttachments({ targetEmail, senderEmail, days, downloadDir: runDir });
+    rawAttachments = await fetchGmailAttachments({ targetEmail, senderEmail, days, downloadDir: runDir, gmailLabel: cfg.GMAIL_LABEL });
   }
 
   if (rawAttachments.length === 0) {
@@ -168,7 +211,7 @@ async function main() {
 
   console.log('');
   logger.info('━━━ Step 2: Cropping images ━━━');
-  const prepared = await prepareAllAttachments(attachments);
+  const prepared = await prepareAllAttachments(attachments, { apiKey: cfg.ANTHROPIC_API_KEY });
 
   if (human) {
     const openCmd = process.platform === 'linux' ? 'xdg-open' : 'open';
@@ -188,12 +231,12 @@ async function main() {
   if (mode === 'ocr') {
     logger.info('━━━ Step 3: OCR scan + Claude text extraction ━━━');
     const ocrResults = await ocrAllImages(prepared);
-    const extracted  = await extractFromOCR(ocrResults, prepared);
+    const extracted  = await extractFromOCR(ocrResults, prepared, { apiKey: cfg.ANTHROPIC_API_KEY });
     bills   = extracted.bills;
     skipped = extracted.skipped;
   } else {
     logger.info('━━━ Step 3: LLM Vision extraction ━━━');
-    bills   = await extractAllBills(prepared);
+    bills   = await extractAllBills(prepared, { apiKey: cfg.ANTHROPIC_API_KEY });
     skipped = [];
   }
 
@@ -239,6 +282,7 @@ async function main() {
   const result = await submitReimbursementClaims(billsWithPaths, {
     broadcast: cliBroadcast,
     waitForConfirm,
+    config: cliOverrides,
   });
 
   // ── Persist run record ─────────────────────────────────────────────────────

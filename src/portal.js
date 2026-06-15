@@ -4,9 +4,9 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const logger = require('./logger');
+const { resolveConfig } = require('./config');
 
 const PORTAL_URL = 'https://mypayroll2.myndsolution.com/Login.aspx?cid=REAINDIA';
-const HEADLESS = process.env.HEADLESS !== 'false';
 
 // ─── Main entry ──────────────────────────────────────────────────────────────
 
@@ -18,7 +18,9 @@ async function submitReimbursementClaims(bills, {
   signal = null,
   waitIfPaused = null,
   waitForConfirm = null,
+  config = {},
 } = {}) {
+  const cfg = resolveConfig(config);
   if (bills.length === 0) {
     return { success: false, error: 'No valid bills to submit', count: 0 };
   }
@@ -62,7 +64,7 @@ async function submitReimbursementClaims(bills, {
   // ── Launch browser ─────────────────────────────────────────────────────────
   progress('launch', 'Launching browser');
   const browser = await puppeteer.launch({
-    headless: HEADLESS,
+    headless: cfg.HEADLESS,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     defaultViewport: { width: 1280, height: 800 },
   });
@@ -84,8 +86,8 @@ async function submitReimbursementClaims(bills, {
     await checkAborted();
 
     // ── Fill credentials ───────────────────────────────────────────────────
-    const username = process.env.PORTAL_USERNAME;
-    const password = process.env.PORTAL_PASSWORD;
+    const username = cfg.PORTAL_USERNAME;
+    const password = cfg.PORTAL_PASSWORD;
     progress('login_fill', username ? 'Entering credentials' : 'Waiting for manual credential entry (30s)');
 
     if (username) {

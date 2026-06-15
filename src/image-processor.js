@@ -4,7 +4,9 @@ const Anthropic = require('@anthropic-ai/sdk');
 const path = require('path');
 const logger = require('./logger');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+function getClient(apiKey) {
+  return new Anthropic({ apiKey: apiKey || process.env.ANTHROPIC_API_KEY });
+}
 
 // ── Smart crop ────────────────────────────────────────────────────────────────
 //
@@ -21,10 +23,9 @@ const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 //     (~60-130), hands/skin (~120-165), and metal surfaces (~140-180)
 //   - Deterministic, free, ~100ms vs 3-5s per image
 
-async function smartCrop(inputPath, feedback = null) {
+async function smartCrop(inputPath, feedback = null, { apiKey } = {}) {
   if (feedback) {
-    // User asked for a specific re-crop — use LLM with their description
-    return smartCropLLM(inputPath, feedback);
+    return smartCropLLM(inputPath, feedback, apiKey);
   }
   return smartCropCV(inputPath);
 }
@@ -171,7 +172,7 @@ async function smartCropCV(inputPath) {
 
 // ── LLM approach (used only when user provides feedback) ─────────────────────
 
-async function smartCropLLM(inputPath, feedback) {
+async function smartCropLLM(inputPath, feedback, apiKey) {
   const outputPath = inputPath.replace(/(\.[^.]+)$/, '_cropped.jpg');
 
   const meta = await sharp(inputPath, { failOn: 'none' }).rotate().metadata();
@@ -193,7 +194,7 @@ async function smartCropLLM(inputPath, feedback) {
 
   let cropJson;
   try {
-    const resp = await client.messages.create({
+    const resp = await getClient(apiKey).messages.create({
       model: 'claude-sonnet-4-6',
       max_tokens: 256,
       messages: [{
@@ -266,17 +267,17 @@ async function rotateSave(inputPath, outputPath) {
     .toFile(outputPath);
 }
 
-async function prepareAttachment(attachment) {
+async function prepareAttachment(attachment, opts = {}) {
   logger.info(`Preparing ${attachment.filename}...`);
-  const croppedPath = await smartCrop(attachment.path);
+  const croppedPath = await smartCrop(attachment.path, null, opts);
   return { ...attachment, croppedPath };
 }
 
-async function prepareAllAttachments(attachments) {
+async function prepareAllAttachments(attachments, opts = {}) {
   const results = [];
   for (const att of attachments) {
     try {
-      results.push(await prepareAttachment(att));
+      results.push(await prepareAttachment(att, opts));
     } catch (err) {
       logger.error(`  Failed to prepare ${att.filename}: ${err.message} — using original`);
       results.push({ ...att, croppedPath: att.path });

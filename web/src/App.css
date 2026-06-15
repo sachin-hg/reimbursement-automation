@@ -143,6 +143,18 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; }
 .btn-lg { padding: 10px 20px; font-size: 14px; }
 
 /* ── Forms ── */
+.input {
+  padding: 7px 10px;
+  font-size: 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  width: 100%;
+  font-family: inherit;
+}
+.input:focus { outline: none; border-color: var(--accent); background: var(--surface); }
+.input::placeholder { color: var(--muted); }
 .field { display: flex; flex-direction: column; gap: 4px; }
 .field label { font-size: 12px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
 .field input, .field textarea {

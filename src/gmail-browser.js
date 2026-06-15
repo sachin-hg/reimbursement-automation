@@ -6,7 +6,7 @@ const logger = require('./logger');
 
 const BROWSER_PROFILE_DIR = path.join(__dirname, '..', '.browser-profile');
 
-async function fetchGmailAttachments({ targetEmail, senderEmail, days, downloadDir }) {
+async function fetchGmailAttachments({ targetEmail, senderEmail, days, downloadDir, gmailLabel }) {
   fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
   fs.mkdirSync(downloadDir, { recursive: true });
 
@@ -46,7 +46,7 @@ async function fetchGmailAttachments({ targetEmail, senderEmail, days, downloadD
 
     // ── 3. Search for emails ─────────────────────────────────────────────────
     // No "has:attachment" filter — emails may contain Drive links instead of attachments
-    const label = (process.env.GMAIL_LABEL || 'Petrol Bill').replace(/ /g, '-');
+    const label = (gmailLabel || process.env.GMAIL_LABEL || 'Petrol Bill').replace(/ /g, '-');
     const query = `from:${senderEmail} label:${label} newer_than:${days}d`;
     const searchUrl = `https://mail.google.com/mail/u/${accountIndex}/#search/${encodeURIComponent(query)}`;
 

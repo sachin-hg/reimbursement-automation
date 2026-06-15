@@ -8,6 +8,7 @@ import Step2Panel from './components/Step2Panel.jsx';
 import Step3Panel from './components/Step3Panel.jsx';
 import Step4Panel from './components/Step4Panel.jsx';
 import RunList from './components/RunList.jsx';
+import SettingsPanel from './components/SettingsPanel.jsx';
 
 // Phases: 'start' | 'step1' | 'cropping' | 'step2' | 'extracting' | 'step3' | 'step4'
 
@@ -32,6 +33,7 @@ export default function App() {
   const [runId, setRunId] = useState(null);
   const [removedIds, setRemovedIds] = useState([]);
   const [includedSkippedIds, setIncludedSkippedIds] = useState([]);
+  const [showSettings, setShowSettings] = useState(false);
   const step3SaveRef = useRef(null);
 
   // On mount: try to restore run from URL path or server state
@@ -326,12 +328,22 @@ export default function App() {
         {phase !== 'start' && (
           <StepBar phase={phase} onNavigate={handleStepNavigate} canNavigate={canNavigateTo} />
         )}
+        <button
+          className="btn btn-ghost btn-sm"
+          onClick={() => setShowSettings(true)}
+          title="Configuration"
+          style={{ fontSize: 16, padding: '4px 8px' }}
+        >
+          ⚙
+        </button>
         {phase !== 'start' && (
           <button className="btn btn-ghost btn-sm" onClick={handleReset}>
             New Run
           </button>
         )}
       </div>
+
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
 
       <div className="main">
         {phase === 'start' && (

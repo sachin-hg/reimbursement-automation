@@ -4,9 +4,12 @@ const fs = require('fs');
 const path = require('path');
 const logger = require('./logger');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+function getClient(apiKey) {
+  return new Anthropic({ apiKey: apiKey || process.env.ANTHROPIC_API_KEY });
+}
 
-async function extractBillData(imagePath) {
+async function extractBillData(imagePath, { apiKey } = {}) {
+  const client = getClient(apiKey);
   const ext = path.extname(imagePath).toLowerCase();
   const mediaType = ext === '.png' ? 'image/png' : 'image/jpeg';
   const base64 = fs.readFileSync(imagePath).toString('base64');
@@ -71,13 +74,13 @@ Extraction tips:
   return parsed;
 }
 
-async function extractAllBills(preparedAttachments) {
+async function extractAllBills(preparedAttachments, opts = {}) {
   const bills = [];
 
   for (const att of preparedAttachments) {
     logger.info(`Extracting bill data: ${att.filename}`);
     try {
-      const data = await extractBillData(att.croppedPath);
+      const data = await extractBillData(att.croppedPath, opts);
       if (data) {
         bills.push({
           ...data,

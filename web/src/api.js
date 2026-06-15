@@ -11,6 +11,8 @@ async function call(method, path, body) {
 
 export const api = {
   status:      ()              => call('GET',    '/api/status'),
+  getConfig:   ()              => call('GET',    '/api/config'),
+  saveConfig:  (c)             => call('PUT',    '/api/config', c),
   start:       (folder)       => call('POST',   '/api/start',      { folder }),
   crop:        ()              => call('POST',   '/api/crop'),
   recrop:      (id, feedback)  => call('POST',   '/api/recrop',     { id, feedback }),
