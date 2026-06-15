@@ -83,6 +83,8 @@ body { background: var(--bg); color: var(--text); min-height: 100vh; }
 .stepbar-item.done .stepbar-dot { background: var(--green); color: white; }
 
 .stepbar-arrow { color: var(--border); font-size: 12px; flex-shrink: 0; }
+.stepbar-item.stepbar-clickable { cursor: pointer; }
+.stepbar-item.stepbar-clickable:hover { opacity: 0.75; }
 
 /* ── Cards ── */
 .card {

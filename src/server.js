@@ -6,8 +6,8 @@ const fs = require('fs');
 const sharp = require('sharp');
 const { smartCrop } = require('./image-processor');
 const { extractBillData } = require('./bill-extractor');
-const { ocrAllImages, extractFromOCR, LOW_CONFIDENCE_THRESHOLD } = require('./ocr-extractor');
-const { submitReimbursementClaims } = require('./portal');
+const { ocrImage, extractFromOCR, LOW_CONFIDENCE_THRESHOLD } = require('./ocr-extractor');
+const { submitReimbursementClaims, retryFailedBills } = require('./portal');
 const logger = require('./logger');
 
 const upload = multer({
@@ -21,6 +21,16 @@ const PORT = process.env.PORT || 3333;
 const DOWNLOADS_DIR = path.join(__dirname, '..', 'downloads');
 const WEB_DIST      = path.join(__dirname, '..', 'web', 'dist');
 const IMAGE_EXTS    = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.heic', '.heif']);
+
+function saveRunMeta(run) {
+  if (!run || !run.runDir) return;
+  try {
+    const { killController, paused, _pausePromise, _pauseResolve, _confirmResolve, ...meta } = run;
+    fs.writeFileSync(path.join(run.runDir, 'meta.json'), JSON.stringify(meta, null, 2));
+  } catch (e) {
+    logger.warn(`saveRunMeta failed: ${e.message}`);
+  }
+}
 
 app.use(express.json({ limit: '10mb' }));
 app.use('/files', express.static(DOWNLOADS_DIR));
@@ -72,28 +82,32 @@ function serializePrepared(p) {
     originalUrl: fileUrl(p.path),
     croppedUrl: fileUrl(p.croppedPath),
     cropStatus: p.cropStatus || 'done',
-    ocrConfidence: p.ocrConfidence ?? null,  // 0-100, null if not yet scanned
-    ocrText: p.ocrText ?? null,
   };
 }
 
 function serializeBill(b) {
+  const base = b.imagePath ? fileUrl(b.imagePath) : null;
   return {
     id: b.id,
     filename: b.filename,
     bill_no: b.bill_no,
     bill_date: b.bill_date,
     bill_amount: b.bill_amount,
-    croppedUrl: fileUrl(b.imagePath),
+    croppedUrl: base ? base + (b.cropTime ? `?t=${b.cropTime}` : '') : null,
+    ocrConfidence: b.ocrConfidence ?? null,
+    ocrText: b.ocrText ?? null,
   };
 }
 
 function serializeSkipped(s) {
+  const base = s.croppedPath ? fileUrl(s.croppedPath) : null;
   return {
     id: s.id,
     filename: s.filename,
     error: s.error || null,
-    croppedUrl: s.croppedPath ? fileUrl(s.croppedPath) : null,
+    croppedUrl: base ? base + (s.cropTime ? `?t=${s.cropTime}` : '') : null,
+    ocrConfidence: s.ocrConfidence ?? null,
+    ocrText: s.ocrText ?? null,
   };
 }
 
@@ -107,6 +121,8 @@ function getRunState() {
     prepared: currentRun.prepared?.map(serializePrepared),
     bills: currentRun.bills?.map(serializeBill),
     skipped: currentRun.skipped?.map(serializeSkipped),
+    removedIds: currentRun.removedIds || [],
+    includedSkippedIds: currentRun.includedSkippedIds || [],
     result: currentRun.result,
     error: currentRun.error,
   };
@@ -138,12 +154,15 @@ app.post('/api/start', (req, res) => {
   fs.mkdirSync(runDir, { recursive: true });
 
   const attachments = files.map((name, i) => {
-    const dst = path.join(runDir, name);
+    const ext = path.extname(name).toLowerCase();
+    const diskName = `img_${i}${ext}`;
+    const dst = path.join(runDir, diskName);
     fs.copyFileSync(path.join(resolved, name), dst);
     return { id: `img_${i}`, filename: name, path: dst };
   });
 
-  currentRun = { id: runId, folder: resolved, runDir, attachments, status: 'loaded' };
+  currentRun = { id: runId, folder: resolved, runDir, attachments, status: 'loaded', createdAt: new Date().toISOString() };
+  saveRunMeta(currentRun);
   logger.info(`Run ${runId}: ${attachments.length} images from ${resolved}`);
 
   res.json({ runId, attachments: attachments.map(serializeAtt) });
@@ -166,8 +185,10 @@ app.post('/api/upload', upload.array('images'), (req, res) => {
 
   // webkitRelativePath comes through as originalname "FolderName/file.jpg" — strip the folder prefix
   const attachments = imageFiles.map((file, i) => {
-    const filename = path.basename(file.originalname);
-    const dst = path.join(runDir, filename);
+    const filename = path.basename(file.originalname);  // original name for display only
+    const ext = path.extname(filename).toLowerCase();
+    const diskName = `img_${i}${ext}`;                  // short name on disk → short cropped name
+    const dst = path.join(runDir, diskName);
     fs.writeFileSync(dst, file.buffer);
     return { id: `img_${i}`, filename, path: dst };
   });
@@ -177,7 +198,8 @@ app.post('/api/upload', upload.array('images'), (req, res) => {
     ? imageFiles[0].originalname.split('/')[0]
     : 'uploaded';
 
-  currentRun = { id: runId, folder: folderName, runDir, attachments, status: 'loaded' };
+  currentRun = { id: runId, folder: folderName, runDir, attachments, status: 'loaded', createdAt: new Date().toISOString() };
+  saveRunMeta(currentRun);
   logger.info(`Run ${runId}: ${attachments.length} images uploaded (${folderName})`);
 
   res.json({ runId, folderName, attachments: attachments.map(serializeAtt) });
@@ -211,22 +233,9 @@ app.post('/api/crop', async (req, res) => {
     }
   }
 
-  // Run OCR on all cropped images so confidence scores are ready before extraction
-  currentRun.status = 'ocr_scanning';
-  broadcast('ocr_start', { total: currentRun.prepared.length });
-  try {
-    const ocrResults = await ocrAllImages(currentRun.prepared);
-    for (const r of ocrResults) {
-      const p = currentRun.prepared.find(x => x.id === r.id);
-      if (p) { p.ocrConfidence = r.confidence; p.ocrText = r.text; }
-    }
-    broadcast('ocr_complete', { scores: ocrResults.map(r => ({ id: r.id, confidence: r.confidence })) });
-  } catch (err) {
-    logger.warn(`OCR scan failed: ${err.message}`);
-  }
-
   currentRun.status = 'crop_done';
   broadcast('crop_complete', { prepared: currentRun.prepared.map(serializePrepared) });
+  saveRunMeta(currentRun);
 });
 
 // AI re-crop single image with optional text feedback
@@ -244,6 +253,7 @@ app.post('/api/recrop', async (req, res) => {
     const idx = currentRun.prepared?.findIndex(p => p.id === id);
     if (idx >= 0) currentRun.prepared[idx] = { ...currentRun.prepared[idx], croppedPath };
 
+    saveRunMeta(currentRun);
     res.json({ id, croppedUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -282,6 +292,7 @@ app.post('/api/manualcrop', async (req, res) => {
     const idx = currentRun.prepared?.findIndex(p => p.id === id);
     if (idx >= 0) currentRun.prepared[idx] = { ...currentRun.prepared[idx], croppedPath: outPath, cropTime };
 
+    saveRunMeta(currentRun);
     res.json({ id, croppedUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -310,15 +321,15 @@ app.post('/api/extract', async (req, res) => {
       try {
         const data = await extractBillData(att.croppedPath);
         if (data) {
-          bills.push({ ...data, id: att.id, imagePath: att.croppedPath, filename: att.filename });
+          bills.push({ ...data, id: att.id, imagePath: att.croppedPath, filename: att.filename, cropTime: att.cropTime ?? null });
           broadcast('extract_result', { id: att.id, type: 'bill', ...data, croppedUrl, filename: att.filename });
         } else {
-          skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath });
+          skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath, cropTime: att.cropTime ?? null });
           broadcast('extract_result', { id: att.id, type: 'skipped', croppedUrl, filename: att.filename });
         }
       } catch (err) {
         logger.error(`Extract ${att.filename}: ${err.message}`);
-        skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath, error: err.message });
+        skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath, cropTime: att.cropTime ?? null, error: err.message });
         broadcast('extract_result', { id: att.id, type: 'skipped', croppedUrl, filename: att.filename, error: err.message });
       }
       broadcast('extract_progress', { done: bills.length + skipped.length, total });
@@ -328,30 +339,63 @@ app.post('/api/extract', async (req, res) => {
     }
 
   } else {
-    // ── OCR mode: batch text + single Claude call ───────────────────────────
-    // Use pre-computed OCR from crop phase; fall back to fresh OCR if missing
-    const ocrResults = toProcess.map(att => ({
-      id: att.id,
-      text: att.ocrText || '',
-      confidence: att.ocrConfidence ?? 0,
-      ocrOk: (att.ocrText || '').length >= 40,
+    // ── OCR mode: two phases ─────────────────────────────────────────────────
+    // Phase 1: All images OCR in parallel (worker pool). Each card appears as
+    //          soon as its OCR completes (ocr_result event), showing the raw text.
+    // Phase 2: One batch Claude text call. extract_result events then update the
+    //          cards with structured bill_no / bill_date / bill_amount.
+
+    broadcast('extract_progress', { done: 0, total, phase: 'ocr' });
+
+    const ocrResults = [];
+    await Promise.all(toProcess.map(async att => {
+      const croppedUrl = fileUrl(att.croppedPath) + (att.cropTime ? `?t=${att.cropTime}` : '');
+      let text = '', confidence = 0;
+      try {
+        ({ text, confidence } = await ocrImage(att.croppedPath));
+        att.ocrText = text;
+        att.ocrConfidence = confidence;
+        logger.info(`  OCR ${att.filename}: ${text.length} chars, confidence ${confidence}`);
+      } catch (err) {
+        logger.warn(`  OCR failed ${att.filename}: ${err.message}`);
+      }
+      ocrResults.push({ id: att.id, text, confidence, ocrOk: text.length >= 40 });
+      broadcast('ocr_result', { id: att.id, filename: att.filename, croppedUrl, ocrText: text, ocrConfidence: confidence });
     }));
 
-    broadcast('extract_progress', { done: 0, total });
+    // Phase 2: batch Claude extraction
+    broadcast('extract_progress', { done: 0, total, phase: 'claude' });
     const result = await extractFromOCR(ocrResults, toProcess, { autoMode: false });
+
+    for (const b of result.bills) {
+      const att = toProcess.find(p => p.id === b.id);
+      const ocr = ocrResults.find(r => r.id === b.id);
+      b.ocrConfidence = ocr?.confidence ?? null;
+      b.ocrText = ocr?.text ?? null;
+      b.cropTime = att?.cropTime ?? null;
+    }
+    for (const s of result.skipped) {
+      const att = toProcess.find(p => p.id === s.id);
+      const ocr = ocrResults.find(r => r.id === s.id);
+      s.ocrConfidence = ocr?.confidence ?? null;
+      s.ocrText = ocr?.text ?? null;
+      s.cropTime = att?.cropTime ?? null;
+    }
     bills.push(...result.bills);
     skipped.push(...result.skipped);
 
     for (const b of bills) {
       const att = toProcess.find(p => p.id === b.id);
       const croppedUrl = fileUrl(b.imagePath) + (att?.cropTime ? `?t=${att.cropTime}` : '');
-      broadcast('extract_result', { id: b.id, type: 'bill', bill_no: b.bill_no, bill_date: b.bill_date,
-        bill_amount: b.bill_amount, croppedUrl, filename: b.filename });
+      broadcast('extract_result', { id: b.id, type: 'bill', bill_no: b.bill_no,
+        bill_date: b.bill_date, bill_amount: b.bill_amount, croppedUrl,
+        filename: b.filename, ocrConfidence: b.ocrConfidence, ocrText: b.ocrText });
     }
     for (const s of skipped) {
       const att = toProcess.find(p => p.id === s.id);
       const croppedUrl = fileUrl(s.croppedPath || '') + (att?.cropTime ? `?t=${att.cropTime}` : '');
-      broadcast('extract_result', { id: s.id, type: 'skipped', croppedUrl, filename: s.filename, error: s.error });
+      broadcast('extract_result', { id: s.id, type: 'skipped', croppedUrl,
+        filename: s.filename, error: s.error, ocrConfidence: s.ocrConfidence, ocrText: s.ocrText });
     }
     broadcast('extract_progress', { done: total, total });
   }
@@ -363,6 +407,7 @@ app.post('/api/extract', async (req, res) => {
     bills: bills.map(serializeBill),
     skipped: skipped.map(serializeSkipped),
   });
+  saveRunMeta(currentRun);
 });
 
 // Re-extract a single bill using LLM vision (called from Step 3 review)
@@ -387,10 +432,35 @@ app.post('/api/reextract', async (req, res) => {
       currentRun.skipped = (currentRun.skipped || []).filter(s => s.id !== id);
     }
 
+    saveRunMeta(currentRun);
     res.json({ id, found: true, bill_no: data.bill_no, bill_date: data.bill_date, bill_amount: data.bill_amount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// Save user-edited bill data + removed/included sets (called before portal submit and after edits)
+app.put('/api/bills', (req, res) => {
+  if (!currentRun) return res.status(400).json({ error: 'No active run' });
+  const { bills, skipped, removedIds, includedSkippedIds } = req.body;
+
+  if (Array.isArray(bills)) {
+    currentRun.bills = bills.map(b => {
+      const orig = (currentRun.bills || []).find(o => o.id === b.id) || {};
+      return { ...orig, bill_no: b.bill_no, bill_date: b.bill_date, bill_amount: b.bill_amount };
+    });
+  }
+  if (Array.isArray(skipped)) {
+    currentRun.skipped = (currentRun.skipped || []).map(s => {
+      const edited = skipped.find(e => e.id === s.id);
+      return edited ? { ...s, bill_no: edited.bill_no, bill_date: edited.bill_date, bill_amount: edited.bill_amount } : s;
+    });
+  }
+  if (Array.isArray(removedIds))          currentRun.removedIds = removedIds;
+  if (Array.isArray(includedSkippedIds))  currentRun.includedSkippedIds = includedSkippedIds;
+
+  saveRunMeta(currentRun);
+  res.json({ ok: true });
 });
 
 // Submit to portal — async
@@ -414,16 +484,151 @@ app.post('/api/submit', async (req, res) => {
     return { ...b, imagePath: orig?.imagePath || null };
   }).filter(b => b.imagePath);
 
+  const killController = new AbortController();
+  currentRun.killController = killController;
+  currentRun.paused = false;
+
+  // waitIfPaused: portal calls this between steps; resolves instantly or waits until resumed
+  function waitIfPaused() {
+    return currentRun?.paused ? (currentRun._pausePromise || Promise.resolve()) : Promise.resolve();
+  }
+
+  // waitForConfirm: portal calls this after all bills are saved; waits for POST /api/submit/confirm
+  function waitForConfirm() {
+    return new Promise(resolve => { currentRun._confirmResolve = resolve; });
+  }
+
   try {
-    const result = await submitReimbursementClaims(billsWithPaths);
+    const result = await submitReimbursementClaims(billsWithPaths, {
+      broadcast,
+      signal: killController.signal,
+      waitIfPaused,
+      waitForConfirm,
+    });
     currentRun.result = result;
     currentRun.status = result.success ? 'done' : 'error';
+    saveRunMeta(currentRun);
     broadcast('submit_complete', { result });
   } catch (err) {
     currentRun.status = 'error';
     currentRun.error  = err.message;
+    saveRunMeta(currentRun);
     broadcast('submit_error', { error: err.message });
+  } finally {
+    if (currentRun) {
+      currentRun.killController = null;
+      if (currentRun._confirmResolve) { currentRun._confirmResolve(); currentRun._confirmResolve = null; }
+      if (currentRun._pauseResolve) { currentRun._pauseResolve(); currentRun._pauseResolve = null; }
+    }
   }
+});
+
+// Kill an in-progress submission
+app.post('/api/submit/kill', (req, res) => {
+  if (currentRun?.killController) {
+    currentRun.killController.abort();
+    res.json({ ok: true });
+  } else {
+    res.json({ ok: false, message: 'No active submission' });
+  }
+});
+
+// Pause / resume submission (honoured between bill entries)
+app.post('/api/submit/pause', (req, res) => {
+  if (!currentRun) return res.status(400).json({ ok: false });
+  if (!currentRun.paused) {
+    currentRun.paused = true;
+    // Create a latch that portal's waitIfPaused() will wait on
+    let resolve;
+    const promise = new Promise(r => { resolve = r; });
+    currentRun._pausePromise = promise;
+    currentRun._pauseResolve = resolve;
+    broadcast('submit_paused', { paused: true });
+  } else {
+    currentRun.paused = false;
+    if (currentRun._pauseResolve) { currentRun._pauseResolve(); }
+    currentRun._pausePromise = null;
+    currentRun._pauseResolve = null;
+    broadcast('submit_paused', { paused: false });
+  }
+  res.json({ ok: true, paused: currentRun.paused });
+});
+
+// Confirm final submit (called from UI after user reviews portal entries)
+app.post('/api/submit/confirm', (req, res) => {
+  if (currentRun?._confirmResolve) {
+    currentRun._confirmResolve();
+    currentRun._confirmResolve = null;
+  }
+  broadcast('submit_confirmed');
+  res.json({ ok: true });
+});
+
+// Retry specific failed bills — portal page is still open during confirm gate
+app.post('/api/submit/retry-failed', async (req, res) => {
+  const { bills } = req.body;
+  if (!Array.isArray(bills) || !bills.length) return res.status(400).json({ error: 'bills required' });
+  res.json({ ok: true });  // respond immediately; result comes via SSE
+  try {
+    await retryFailedBills(bills);
+  } catch (err) {
+    broadcast('submit_progress', { id: 'retry_error', step: 'error', label: `Retry error: ${err.message}`, status: 'error' });
+  }
+});
+
+// List all saved runs (newest first)
+app.get('/api/runs', (req, res) => {
+  if (!fs.existsSync(DOWNLOADS_DIR)) return res.json([]);
+  try {
+    const runs = fs.readdirSync(DOWNLOADS_DIR)
+      .filter(name => /^run_\d+$/.test(name))
+      .map(name => {
+        const metaPath = path.join(DOWNLOADS_DIR, name, 'meta.json');
+        if (!fs.existsSync(metaPath)) return null;
+        try {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          return {
+            id: meta.id,
+            folder: meta.folder,
+            status: meta.status,
+            createdAt: meta.createdAt,
+            billCount: meta.bills?.length || 0,
+            attachmentCount: meta.attachments?.length || 0,
+          };
+        } catch { return null; }
+      })
+      .filter(Boolean)
+      .sort((a, b) => b.id.localeCompare(a.id));
+    res.json(runs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Activate a saved run as currentRun
+app.post('/api/runs/:id/activate', (req, res) => {
+  const runDir = path.join(DOWNLOADS_DIR, req.params.id);
+  const metaPath = path.join(runDir, 'meta.json');
+  if (!fs.existsSync(metaPath)) return res.status(404).json({ error: 'Run not found' });
+  try {
+    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    // Don't leave it stuck in submitting state on reload
+    if (meta.status === 'submitting') meta.status = 'extracted';
+    currentRun = { ...meta, killController: null, paused: false };
+    res.json({ run: getRunState() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a saved run (removes directory and clears currentRun if it matches)
+app.delete('/api/runs/:id', (req, res) => {
+  const { id } = req.params;
+  const runDir = path.join(DOWNLOADS_DIR, id);
+  if (!fs.existsSync(runDir)) return res.status(404).json({ error: 'Run not found' });
+  if (currentRun?.id === id) currentRun = null;
+  fs.rmSync(runDir, { recursive: true, force: true });
+  res.json({ ok: true });
 });
 
 app.delete('/api/run', (req, res) => {
@@ -438,4 +643,62 @@ app.use((req, res) => {
   else res.status(404).send('Web app not built yet. Run: cd web && npm run build');
 });
 
-app.listen(PORT, () => logger.info(`Server → http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  logger.info(`Server → http://localhost:${PORT}`);
+  migrateOldRuns();
+});
+
+// Backfill meta.json for run directories created before persistence was added.
+function migrateOldRuns() {
+  if (!fs.existsSync(DOWNLOADS_DIR)) return;
+  const dirs = fs.readdirSync(DOWNLOADS_DIR).filter(n => /^run_\d+$/.test(n));
+  let migrated = 0;
+  for (const name of dirs) {
+    const runDir = path.join(DOWNLOADS_DIR, name);
+    const metaPath = path.join(runDir, 'meta.json');
+    if (fs.existsSync(metaPath)) continue;
+    try {
+      const files = fs.readdirSync(runDir);
+      const originals = files.filter(f => {
+        const ext = path.extname(f).toLowerCase();
+        return IMAGE_EXTS.has(ext) && !f.includes('_cropped') && !f.startsWith('.');
+      });
+      if (!originals.length) continue;
+
+      const ts = parseInt(name.replace('run_', ''), 10);
+      const createdAt = isNaN(ts) ? new Date().toISOString() : new Date(ts).toISOString();
+
+      const attachments = originals.map((f, i) => ({
+        id: `img_${i}`, filename: f, path: path.join(runDir, f),
+      }));
+
+      const prepared = attachments.map(a => {
+        const base = path.basename(a.filename, path.extname(a.filename));
+        const croppedPath = path.join(runDir, base + '_cropped.jpg');
+        return {
+          ...a,
+          croppedPath: fs.existsSync(croppedPath) ? croppedPath : a.path,
+          cropStatus: fs.existsSync(croppedPath) ? 'done' : 'error',
+        };
+      });
+
+      const hasCrops = prepared.some(p => p.cropStatus === 'done');
+
+      // Derive a display folder name from the run timestamp
+      const dateStr = isNaN(ts) ? '' : new Date(ts).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+      const folder = `Run from ${dateStr}`;
+
+      const meta = {
+        id: name, folder, runDir,
+        status: hasCrops ? 'crop_done' : 'loaded',
+        createdAt,
+        attachments,
+        prepared: hasCrops ? prepared : null,
+        bills: [], skipped: [],
+      };
+      fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+      migrated++;
+    } catch { /* skip */ }
+  }
+  if (migrated) logger.info(`Migrated ${migrated} old run(s) to meta.json`);
+}

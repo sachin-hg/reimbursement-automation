@@ -2,31 +2,16 @@ import { useState } from 'react';
 import { api } from '../api.js';
 import ImageCropCard from './ImageCropCard.jsx';
 
-const CONF_LOW = 55; // matches server LOW_CONFIDENCE_THRESHOLD
-
-function confidenceBadge(score) {
-  if (score === null || score === undefined) return null;
-  const color = score >= 70 ? 'badge-green' : score >= CONF_LOW ? 'badge-yellow' : 'badge-red';
-  return <span className={`badge ${color}`} title="OCR confidence">{score}%</span>;
-}
-
-export default function Step2Panel({ prepared, totalImages, onExtractStarted }) {
+export default function Step2Panel({ prepared, totalImages, onExtractStarted, onBack }) {
   const [decisions, setDecisions] = useState({});
-  const [mode, setMode] = useState('ocr'); // 'ocr' | 'llm'
   const [loading, setLoading] = useState(false);
+  const [mode, setMode] = useState('ocr'); // 'ocr' | 'llm'
 
   const approvedIds = prepared.filter(p => decisions[p.id] === 'approved').map(p => p.id);
   const pendingCount  = prepared.filter(p => !decisions[p.id]).length;
   const approvedCount = approvedIds.length;
   const rejectedCount = prepared.filter(p => decisions[p.id] === 'rejected').length;
   const stillCropping = prepared.length < totalImages;
-
-  // Sort: show low-confidence images first so they stand out
-  const sorted = [...prepared].sort((a, b) => {
-    const ca = a.ocrConfidence ?? 101;
-    const cb = b.ocrConfidence ?? 101;
-    return ca - cb;
-  });
 
   function decide(id, decision) { setDecisions(d => ({ ...d, [id]: decision })); }
   function approveAll() { const n = {}; prepared.forEach(p => { n[p.id] = 'approved'; }); setDecisions(n); }
@@ -45,8 +30,6 @@ export default function Step2Panel({ prepared, totalImages, onExtractStarted }) 
     }
   }
 
-  const lowConfCount = prepared.filter(p => p.ocrConfidence !== null && p.ocrConfidence !== undefined && p.ocrConfidence < CONF_LOW).length;
-
   return (
     <div>
       <div className="section-header">
@@ -56,7 +39,6 @@ export default function Step2Panel({ prepared, totalImages, onExtractStarted }) 
             <span className="badge badge-green">{approvedCount} approved</span>
             {rejectedCount > 0 && <span className="badge badge-red">{rejectedCount} rejected</span>}
             {pendingCount > 0 && <span className="badge badge-gray">{pendingCount} pending</span>}
-            {lowConfCount > 0 && <span className="badge badge-red" title="Low OCR confidence — review carefully">⚠ {lowConfCount} low confidence</span>}
             {stillCropping && (
               <span className="badge badge-blue">
                 <span className="spinner" style={{ width: 10, height: 10, borderWidth: 1.5 }} />
@@ -89,17 +71,21 @@ export default function Step2Panel({ prepared, totalImages, onExtractStarted }) 
         </div>
       )}
 
-      {sorted.map(item => (
+      {prepared.map(item => (
         <ImageCropCard
           key={item.id}
           item={item}
           decision={decisions[item.id]}
           onDecide={decide}
-          confidenceBadge={confidenceBadge(item.ocrConfidence)}
         />
       ))}
 
       <div className="sticky-footer">
+        {onBack && (
+          <button className="btn btn-ghost" onClick={onBack} style={{ marginRight: 'auto' }}>
+            ← Back
+          </button>
+        )}
         {/* Extraction mode toggle */}
         <div className="row" style={{ gap: 8 }}>
           <span className="muted" style={{ fontSize: 12 }}>Extract via:</span>
@@ -117,9 +103,6 @@ export default function Step2Panel({ prepared, totalImages, onExtractStarted }) 
               >{label}</button>
             ))}
           </div>
-          {mode === 'ocr' && lowConfCount > 0 && (
-            <span className="muted" style={{ fontSize: 11 }}>⚠ {lowConfCount} low-confidence will use LLM fallback</span>
-          )}
         </div>
 
         <button

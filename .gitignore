@@ -1,6 +1,31 @@
+# Environment / secrets
 .env
+.env.*
+!.env.example
+
+# Dependencies
 node_modules/
+web/node_modules/
+
+# Run data — downloaded images and extracted bill data
 downloads/
+
+# Browser session — contains Google login cookies
+.browser-profile/
+
+# Logs
 logs/
 *.log
-.browser-profile/
+
+# Build output
+web/dist/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

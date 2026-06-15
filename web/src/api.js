@@ -17,8 +17,16 @@ export const api = {
   manualcrop:  (id, pcts)      => call('POST',   '/api/manualcrop', { id, ...pcts }),
   extract:     (approvedIds, mode = 'ocr') => call('POST', '/api/extract', { approvedIds, mode }),
   reextract:   (id)            => call('POST',   '/api/reextract',  { id }),
+  saveBills:   (data)          => call('PUT',    '/api/bills',       data),
   submit:      (bills)         => call('POST',   '/api/submit',     { bills }),
+  killSubmit:  ()              => call('POST',   '/api/submit/kill'),
+  pauseSubmit: ()              => call('POST',   '/api/submit/pause'),
+  confirmSubmit: ()            => call('POST',   '/api/submit/confirm'),
+  retryFailed:  (bills)        => call('POST',   '/api/submit/retry-failed', { bills }),
   resetRun:    ()              => call('DELETE', '/api/run'),
+  listRuns:    ()              => call('GET',    '/api/runs'),
+  activateRun: (id)            => call('POST',   `/api/runs/${id}/activate`),
+  deleteRun:   (id)            => call('DELETE', `/api/runs/${id}`),
 
   upload: async (files) => {
     const form = new FormData();

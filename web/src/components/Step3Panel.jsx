@@ -7,14 +7,23 @@ export default function Step3Panel({
   skipped: initialSkipped,
   extractProgress,
   extractTotal,
+  initialRemovedIds = [],
+  initialIncludedIds = [],
   onSubmitStarted,
+  onBack,
+  onSaveState,
+  onRegisterSave,
 }) {
   const [bills, setBills]     = useState(initialBills);
   const [skipped, setSkipped] = useState(
-    initialSkipped.map(s => ({ ...s, bill_no: '', bill_date: '', bill_amount: '' }))
+    initialSkipped.map(s => ({ ...s, bill_no: s.bill_no || '', bill_date: s.bill_date || '', bill_amount: s.bill_amount || '' }))
   );
-  const [included, setIncluded]   = useState({});
-  const [removed, setRemoved]     = useState(new Set());
+  const [included, setIncluded] = useState(() => {
+    const m = {};
+    for (const id of initialIncludedIds) m[id] = true;
+    return m;
+  });
+  const [removed, setRemoved] = useState(() => new Set(initialRemovedIds));
   const [loading, setLoading]     = useState(false);
 
   // Sync from parent while SSE events are arriving during extraction
@@ -25,8 +34,34 @@ export default function Step3Panel({
     );
   }, [initialSkipped]);
 
+  // Register current-state save fn with parent so step bar navigation can save before leaving
+  useEffect(() => {
+    onRegisterSave?.(() => {
+      const state = {
+        bills,
+        skipped,
+        removedIds: [...removed],
+        includedSkippedIds: Object.keys(included).filter(id => included[id]),
+      };
+      return api.saveBills(state).then(() => state);
+    });
+  });
+
+  async function handleBack() {
+    const state = {
+      bills,
+      skipped,
+      removedIds: [...removed],
+      includedSkippedIds: Object.keys(included).filter(id => included[id]),
+    };
+    await api.saveBills(state).catch(() => {});
+    onSaveState?.(state);
+    onBack();
+  }
+
   // Drive progress from props (not stale local state) so the bar stays accurate
-  const stillExtracting = extractTotal > 0 && (initialBills.length + initialSkipped.length) < extractTotal;
+  const stillExtracting = extractTotal > 0 &&
+    ((initialBills.length + initialSkipped.length) < extractTotal || initialBills.some(b => b.extracting));
 
   function updateBill(id, updated) {
     setBills(bs => bs.map(b => b.id === id ? updated : b));
@@ -68,6 +103,15 @@ export default function Step3Panel({
     if (!allBillsToSubmit.length) return;
     setLoading(true);
     try {
+      const state = {
+        bills,
+        skipped,
+        removedIds: [...removed],
+        includedSkippedIds: Object.keys(included).filter(id => included[id]),
+      };
+      // Persist edits to server AND sync to App state so "Try Again" restores edits correctly
+      await api.saveBills(state).catch(() => {});
+      onSaveState?.(state);
       await api.submit(allBillsToSubmit);
       onSubmitStarted();
     } catch (err) {
@@ -111,18 +155,25 @@ export default function Step3Panel({
 
       {stillExtracting && (
         <div className="card mb16" style={{ padding: '10px 16px' }}>
-          <div className="row" style={{ marginBottom: 6 }}>
-            <span className="spinner" />
-            <span className="muted">
-              Extracting {bills.length + skipped.length + 1} of {extractTotal}…
-            </span>
-          </div>
-          <div className="progress-bar">
-            <div
-              className="progress-bar-fill"
-              style={{ width: `${((bills.length + skipped.length) / extractTotal) * 100}%` }}
-            />
-          </div>
+          {(() => {
+            const ocrPhase = (initialBills.length + initialSkipped.length) < extractTotal;
+            const pct = Math.min(100, ((initialBills.length + initialSkipped.length) / extractTotal) * 100);
+            return (
+              <>
+                <div className="row" style={{ marginBottom: 6 }}>
+                  <span className="spinner" />
+                  <span className="muted">
+                    {ocrPhase
+                      ? `OCR scanning image ${initialBills.length + initialSkipped.length + 1} of ${extractTotal}…`
+                      : `Extracting structured data with Claude…`}
+                  </span>
+                </div>
+                <div className="progress-bar">
+                  <div className="progress-bar-fill" style={{ width: `${ocrPhase ? pct : 100}%` }} />
+                </div>
+              </>
+            );
+          })()}
         </div>
       )}
 
@@ -167,6 +218,11 @@ export default function Step3Panel({
       )}
 
       <div className="sticky-footer">
+        {onBack && (
+          <button className="btn btn-ghost" onClick={handleBack} style={{ marginRight: 'auto' }}>
+            ← Back
+          </button>
+        )}
         <div>
           <div className="bold">{allBillsToSubmit.length} bill{allBillsToSubmit.length !== 1 ? 's' : ''} to submit</div>
           <div className="muted small">Total: ₹{total.toFixed(2)}</div>
