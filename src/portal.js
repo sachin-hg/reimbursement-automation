@@ -10,14 +10,12 @@ const PORTAL_URL = 'https://mypayroll2.myndsolution.com/Login.aspx?cid=REAINDIA'
 
 // ─── Main entry ──────────────────────────────────────────────────────────────
 
-// Shared context for retry (set while waiting at confirmation gate)
-let _retryCtx = null;
-
 async function submitReimbursementClaims(bills, {
   broadcast = () => {},
   signal = null,
   waitIfPaused = null,
   waitForConfirm = null,
+  onRetryCtx = null,
   config = {},
 } = {}) {
   const cfg = resolveConfig(config);
@@ -302,8 +300,9 @@ async function submitReimbursementClaims(bills, {
 
     // ── User confirmation gate ─────────────────────────────────────────────
     await checkAborted();
-    // Store context so retryFailedBills() can reuse the still-open page
-    _retryCtx = { page, doOneBill, progress, broadcast, checkAborted, successCount, failedBills, totalBills: bills.length };
+    // Build per-run retry context and hand it to the caller (server stores it keyed by runId).
+    const retryCtx = { page, doOneBill, progress, broadcast, checkAborted, successCount, failedBills, totalBills: bills.length };
+    if (onRetryCtx) onRetryCtx(retryCtx);
     progress('user_confirm', `${successCount} of ${bills.length} bills uploaded — waiting for your review`);
     broadcast('submit_awaiting_confirm', { successCount, failCount: failedBills.length, total: bills.length, failedBills });
     if (waitForConfirm) await waitForConfirm();
@@ -336,8 +335,8 @@ async function submitReimbursementClaims(bills, {
     if (!/successfully|success/i.test(bodyText)) {
       logger.warn('Submit: could not detect success text after network idle — check portal manually');
     }
-    const finalFailCount = _retryCtx?.failedBills?.length ?? failedBills.length;
-    const finalSuccessCount = _retryCtx?.successCount ?? successCount;
+    const finalFailCount = retryCtx.failedBills.length;
+    const finalSuccessCount = retryCtx.successCount;
     const finalMsg = finalFailCount > 0
       ? `${finalSuccessCount} submitted, ${finalFailCount} failed`
       : `${finalSuccessCount} bill${finalSuccessCount !== 1 ? 's' : ''} submitted successfully!`;
@@ -350,16 +349,15 @@ async function submitReimbursementClaims(bills, {
     progress('error', err.message, 'error');
     return { success: false, error: err.message, count: 0 };
   } finally {
-    _retryCtx = null;
     await browser.close();
   }
 }
 
 // ─── Retry failed bills ───────────────────────────────────────────────────────
 
-async function retryFailedBills(billsToRetry) {
-  if (!_retryCtx) throw new Error('No active submission to retry — confirm gate has passed or submission not running');
-  const { page, doOneBill, progress, broadcast, checkAborted, totalBills } = _retryCtx;
+async function retryFailedBills(billsToRetry, retryCtx) {
+  if (!retryCtx) throw new Error('No active submission to retry — confirm gate has passed or submission not running');
+  const { page, doOneBill, progress, broadcast, checkAborted, totalBills } = retryCtx;
   const stillFailed = [];
 
   for (let i = 0; i < billsToRetry.length; i++) {
@@ -375,7 +373,7 @@ async function retryFailedBills(billsToRetry) {
     await checkAborted().catch(() => {});
     try {
       await doOneBill(bill, displayIndex, totalBills);
-      _retryCtx.successCount++;
+      retryCtx.successCount++;
       progress('bill_error', `Bill ${displayIndex} retry succeeded`, 'done', billMeta);
     } catch (err) {
       if (err.message?.includes('cancelled')) throw err;
@@ -396,10 +394,10 @@ async function retryFailedBills(billsToRetry) {
     }
   }
 
-  _retryCtx.failedBills = stillFailed;
-  progress('user_confirm', `${_retryCtx.successCount} of ${totalBills} bills uploaded — waiting for your review`);
+  retryCtx.failedBills = stillFailed;
+  progress('user_confirm', `${retryCtx.successCount} of ${totalBills} bills uploaded — waiting for your review`);
   broadcast('submit_awaiting_confirm', {
-    successCount: _retryCtx.successCount,
+    successCount: retryCtx.successCount,
     failCount: stillFailed.length,
     total: totalBills,
     failedBills: stillFailed,

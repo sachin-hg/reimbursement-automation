@@ -5,6 +5,7 @@ const logger = require('./logger');
 const { startIdleWatcher, fetchMessage, markAsSeen } = require('./imap-watcher');
 const { prepareAllAttachments } = require('./image-processor');
 const { ocrAllImages, extractFromOCR } = require('./ocr-extractor');
+const { extractBillData } = require('./bill-extractor');
 const { submitReimbursementClaims } = require('./portal');
 const { sendReply } = require('./mailer');
 
@@ -57,7 +58,10 @@ async function processEmail(uid) {
     // autoMode=true: silently skip low-confidence images rather than sending noise to Claude
     logger.info('Step 3: Extracting bill data (OCR + Claude)...');
     const ocrResults = await ocrAllImages(prepared);
-    const { bills, skipped } = await extractFromOCR(ocrResults, prepared, { autoMode: true });
+    const { bills, skipped } = await extractFromOCR(ocrResults, prepared, {
+      autoMode: true,
+      llmFallback: (imagePath) => extractBillData(imagePath),
+    });
 
     if (skipped.length > 0) {
       logger.warn(`  ${skipped.length} image(s) skipped (low OCR confidence): ${skipped.map(s => s.filename).join(', ')}`);

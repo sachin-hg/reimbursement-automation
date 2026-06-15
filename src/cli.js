@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 require('dotenv').config();
+const crypto = require('crypto');
+const os = require('os');
 const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
@@ -10,10 +12,30 @@ const { fetchGmailAttachments } = require('./gmail-browser');
 const { prepareAllAttachments } = require('./image-processor');
 const { extractAllBills } = require('./bill-extractor');
 const { ocrAllImages, extractFromOCR } = require('./ocr-extractor');
+const { extractBillData } = require('./bill-extractor');
 const { submitReimbursementClaims } = require('./portal');
 
 const DOWNLOADS_DIR = path.join(__dirname, '..', 'downloads');
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.heic', '.heif']);
+
+// ── Session token ─────────────────────────────────────────────────────────────
+// Stored in ~/.reimbursement-automation-token so CLI runs are associated with
+// the same user across sessions. Use --token to override or restore a saved token.
+const TOKEN_FILE = path.join(os.homedir(), '.reimbursement-automation-token');
+
+function getCliToken(explicit) {
+  if (explicit) {
+    try { fs.writeFileSync(TOKEN_FILE, explicit.trim(), 'utf8'); } catch {}
+    return explicit.trim();
+  }
+  try {
+    const saved = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+    if (saved) return saved;
+  } catch {}
+  const token = crypto.randomUUID();
+  try { fs.writeFileSync(TOKEN_FILE, token, 'utf8'); } catch {}
+  return token;
+}
 
 // ── CLI arg parsing ────────────────────────────────────────────────────────────
 
@@ -34,6 +56,7 @@ function parseArgs() {
     password:   null,
     headless:   null,  // null = use .env; true/false = explicit override
     gmailLabel: null,
+    token:      null,  // session token — defaults to ~/.reimbursement-automation-token
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -49,6 +72,7 @@ function parseArgs() {
     else if (args[i] === '--headless')                        opts.headless   = true;
     else if (args[i] === '--no-headless')                     opts.headless   = false;
     else if (args[i] === '--gmail-label' || args[i] === '-l') opts.gmailLabel = args[++i];
+    else if (args[i] === '--token'       || args[i] === '-t') opts.token      = args[++i];
     else if (args[i] === '--help'        || args[i] === '-h') {
       console.log(`
 Usage: node src/cli.js [options]
@@ -64,13 +88,16 @@ Behaviour:
   --human,  -H              Pause for confirmation after each step
 
 Config overrides (all fall back to .env if not provided):
-  --api-key,     -k  <key>  Anthropic API key
-  --username,    -u  <id>   Portal username / employee ID
-  --password,    -p  <pwd>  Portal password
+  --api-key,     -k  <key>    Anthropic API key
+  --username,    -u  <id>     Portal username / employee ID
+  --password,    -p  <pwd>    Portal password
   --headless / --no-headless  Run browser headless (default: HEADLESS in .env, or false)
-  --gmail-label, -l  <lbl>  Gmail label to search (default: GMAIL_LABEL in .env, or "Petrol Bill")
+  --gmail-label, -l  <lbl>    Gmail label to search (default: GMAIL_LABEL in .env, or "Petrol Bill")
+  --token,       -t  <uuid>   Session token (default: ~/.reimbursement-automation-token)
+                              Use to associate CLI runs with a specific browser session, or
+                              to restore access to runs created with a different token.
 
-  --help,   -h              Show this help
+  --help,   -h                Show this help
 
 Examples:
   node src/cli.js --folder ~/Downloads/petrol-bills
@@ -157,7 +184,7 @@ function cliBroadcast(event, data) {
 
 async function main() {
   const { email: targetEmail, sender: senderEmail, days, folder, human, mode,
-          apiKey, username, password, headless, gmailLabel } = parseArgs();
+          apiKey, username, password, headless, gmailLabel, token: tokenArg } = parseArgs();
 
   // Build CLI config overrides — only non-null values override .env
   const cliOverrides = {};
@@ -168,6 +195,9 @@ async function main() {
   if (gmailLabel != null) cliOverrides.GMAIL_LABEL      = gmailLabel;
   const cfg = resolveConfig(cliOverrides);
 
+  // Resolve session token — associates this CLI run with a browser session.
+  const token = getCliToken(tokenArg);
+
   const runId  = `run_${Date.now()}`;
   const runDir = path.join(DOWNLOADS_DIR, runId);
   fs.mkdirSync(runDir, { recursive: true });
@@ -176,6 +206,7 @@ async function main() {
   logger.info('Reimbursement automation — manual trigger');
   if (human) logger.info('  Mode          : human-in-the-loop');
   logger.info(`  Extract mode  : ${mode}`);
+  logger.info(`  Session token : ${token.slice(0, 8)}… (${TOKEN_FILE})`);
 
   let rawAttachments;
 
@@ -231,7 +262,12 @@ async function main() {
   if (mode === 'ocr') {
     logger.info('━━━ Step 3: OCR scan + Claude text extraction ━━━');
     const ocrResults = await ocrAllImages(prepared);
-    const extracted  = await extractFromOCR(ocrResults, prepared, { apiKey: cfg.ANTHROPIC_API_KEY });
+    // In autonomous mode (no --human): low-confidence images fall back to LLM vision automatically.
+    // In human mode: they're included in the batch for human review (user can re-extract per-card).
+    const extracted  = await extractFromOCR(ocrResults, prepared, {
+      apiKey: cfg.ANTHROPIC_API_KEY,
+      llmFallback: human ? null : (imagePath) => extractBillData(imagePath, { apiKey: cfg.ANTHROPIC_API_KEY }),
+    });
     bills   = extracted.bills;
     skipped = extracted.skipped;
   } else {
@@ -263,21 +299,20 @@ async function main() {
     .map(b => ({ ...b, imagePath: b.imagePath || b.croppedPath }))
     .filter(b => b.imagePath);
 
-  // Step 3 confirm always shown — last safety gate before money moves
-  await confirmStep(true, 'Step 3 complete', `${billsWithPaths.length} bill(s) ready. Proceed with portal submission?`);
+  await confirmStep(human, 'Step 3 complete', `${billsWithPaths.length} bill(s) ready. Proceed with portal submission?`);
 
   // ── Step 4: Submit to portal ───────────────────────────────────────────────
 
   console.log('');
   logger.info('━━━ Step 4: Submitting to payroll portal ━━━');
 
-  // Matches the web UI confirmation gate: portal pauses after entering all bills
-  // so you can review the browser before the final "I Agree + Submit" click
-  const waitForConfirm = () => new Promise(resolve =>
+  // In human mode: pause after all bills are entered so user can review the browser window.
+  // In autonomous mode: proceed immediately.
+  const waitForConfirm = human ? () => new Promise(resolve =>
     confirmStep(true, 'Portal review',
       'All bills entered in portal. Review browser window then proceed with final submission?'
     ).then(resolve)
-  );
+  ) : null;
 
   const result = await submitReimbursementClaims(billsWithPaths, {
     broadcast: cliBroadcast,
@@ -289,6 +324,7 @@ async function main() {
 
   const meta = {
     id: runId, runDir,
+    userToken: token,
     source: folder ? 'folder' : 'gmail',
     mode,
     createdAt: new Date().toISOString(),

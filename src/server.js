@@ -1,4 +1,5 @@
 require('dotenv').config();
+const crypto  = require('crypto');
 const express = require('express');
 const multer  = require('multer');
 const path = require('path');
@@ -8,7 +9,7 @@ const { smartCrop } = require('./image-processor');
 const { extractBillData } = require('./bill-extractor');
 const { ocrImage, extractFromOCR, LOW_CONFIDENCE_THRESHOLD } = require('./ocr-extractor');
 const { submitReimbursementClaims, retryFailedBills } = require('./portal');
-const { resolveConfig } = require('./config');
+const { resolveConfig, isProd } = require('./config');
 const logger = require('./logger');
 
 const upload = multer({
@@ -23,14 +24,71 @@ const DOWNLOADS_DIR = path.join(__dirname, '..', 'downloads');
 const WEB_DIST      = path.join(__dirname, '..', 'web', 'dist');
 const IMAGE_EXTS    = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.heic', '.heif']);
 
+// ── Session tokens ────────────────────────────────────────────────────────────
+// Each browser gets a UUID cookie (userToken) that namespaces its runs.
+// Not real auth — tokens are unguessable but not signed. Good enough for a
+// shared-server "don't see each other's runs" requirement.
+
+const TEN_YEARS_MS = 315360000000;
+
+function parseCookies(req) {
+  const out = {};
+  for (const part of (req.headers.cookie || '').split(';')) {
+    const idx = part.indexOf('=');
+    if (idx < 0) continue;
+    const k = decodeURIComponent(part.slice(0, idx).trim());
+    const v = decodeURIComponent(part.slice(idx + 1).trim());
+    if (k) out[k] = v;
+  }
+  return out;
+}
+
+// Returns the caller's token, creating + setting a cookie if this is their first visit.
+// Must be called before res.json() / res.send() so the Set-Cookie header makes it out.
+function getToken(req, res) {
+  const cookies = parseCookies(req);
+  if (cookies.userToken) return cookies.userToken;
+  const token = crypto.randomUUID();
+  res.cookie('userToken', token, {
+    maxAge: TEN_YEARS_MS,
+    httpOnly: false,   // JS-readable so the UI can display / copy it
+    sameSite: 'Strict',
+    path: '/',
+  });
+  return token;
+}
+
+// ── Per-run state ─────────────────────────────────────────────────────────────
+// Each active run lives in this Map; runs are added on /start or /upload,
+// loaded on /runs/:id/activate, and removed on /run DELETE or /runs/:id DELETE.
+// Multiple runs can be in flight simultaneously (parallel tabs / CLI + server).
+
+const activeRuns = new Map();          // runId → run object
+const sseClientsByRun = new Map();     // runId → Set<res>
+
 function saveRunMeta(run) {
   if (!run || !run.runDir) return;
   try {
-    const { killController, paused, _pausePromise, _pauseResolve, _confirmResolve, ...meta } = run;
+    const { killController, paused, _pausePromise, _pauseResolve, _confirmResolve, _retryCtx, ...meta } = run;
     fs.writeFileSync(path.join(run.runDir, 'meta.json'), JSON.stringify(meta, null, 2));
   } catch (e) {
     logger.warn(`saveRunMeta failed: ${e.message}`);
   }
+}
+
+function broadcastTo(runId, type, payload = {}) {
+  const clients = sseClientsByRun.get(runId);
+  if (!clients || !clients.size) return;
+  const msg = `data: ${JSON.stringify({ type, ...payload })}\n\n`;
+  clients.forEach(res => { try { res.write(msg); } catch {} });
+}
+
+// Look up run and write a 400/404 error response if missing.
+function getRun(runId, res) {
+  if (!runId) { res.status(400).json({ error: 'runId required' }); return null; }
+  const run = activeRuns.get(runId);
+  if (!run) { res.status(400).json({ error: 'Run not active — start or activate a run first' }); return null; }
+  return run;
 }
 
 app.use(express.json({ limit: '10mb' }));
@@ -40,13 +98,6 @@ if (fs.existsSync(WEB_DIST)) app.use(express.static(WEB_DIST));
 
 // ── SSE ───────────────────────────────────────────────────────────────────────
 
-const sseClients = new Set();
-
-function broadcast(type, payload = {}) {
-  const msg = `data: ${JSON.stringify({ type, ...payload })}\n\n`;
-  sseClients.forEach(res => { try { res.write(msg); } catch {} });
-}
-
 app.get('/api/events', (req, res) => {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -54,40 +105,50 @@ app.get('/api/events', (req, res) => {
     'Connection': 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  sseClients.add(res);
-  res.on('close', () => sseClients.delete(res));
 
-  // Send current state so a page refresh can recover
-  if (currentRun) res.write(`data: ${JSON.stringify({ type: 'state', run: getRunState() })}\n\n`);
+  const { runId } = req.query;
+  if (runId) {
+    if (!sseClientsByRun.has(runId)) sseClientsByRun.set(runId, new Set());
+    sseClientsByRun.get(runId).add(res);
+    res.on('close', () => {
+      const clients = sseClientsByRun.get(runId);
+      if (clients) {
+        clients.delete(res);
+        if (!clients.size) sseClientsByRun.delete(runId);
+      }
+    });
+
+    // Send current state so a reconnecting client can recover
+    const run = activeRuns.get(runId);
+    if (run) res.write(`data: ${JSON.stringify({ type: 'state', run: getRunState(run) })}\n\n`);
+  }
 
   const hb = setInterval(() => { try { res.write(': ping\n\n'); } catch { clearInterval(hb); } }, 20000);
   res.on('close', () => clearInterval(hb));
 });
 
-// ── Run state ─────────────────────────────────────────────────────────────────
+// ── Serialisation helpers (all take run as first arg) ────────────────────────
 
-let currentRun = null;
-
-function fileUrl(filename) {
-  return `/files/${currentRun.id}/${path.basename(filename)}`;
+function fileUrl(run, filename) {
+  return `/files/${run.id}/${path.basename(filename)}`;
 }
 
-function serializeAtt(a) {
-  return { id: a.id, filename: a.filename, originalUrl: fileUrl(a.path) };
+function serializeAtt(run, a) {
+  return { id: a.id, filename: a.filename, originalUrl: fileUrl(run, a.path) };
 }
 
-function serializePrepared(p) {
+function serializePrepared(run, p) {
   return {
     id: p.id,
     filename: p.filename,
-    originalUrl: fileUrl(p.path),
-    croppedUrl: fileUrl(p.croppedPath),
+    originalUrl: fileUrl(run, p.path),
+    croppedUrl: fileUrl(run, p.croppedPath),
     cropStatus: p.cropStatus || 'done',
   };
 }
 
-function serializeBill(b) {
-  const base = b.imagePath ? fileUrl(b.imagePath) : null;
+function serializeBill(run, b) {
+  const base = b.imagePath ? fileUrl(run, b.imagePath) : null;
   return {
     id: b.id,
     filename: b.filename,
@@ -100,8 +161,8 @@ function serializeBill(b) {
   };
 }
 
-function serializeSkipped(s) {
-  const base = s.croppedPath ? fileUrl(s.croppedPath) : null;
+function serializeSkipped(run, s) {
+  const base = s.croppedPath ? fileUrl(run, s.croppedPath) : null;
   return {
     id: s.id,
     filename: s.filename,
@@ -112,26 +173,34 @@ function serializeSkipped(s) {
   };
 }
 
-function getRunState() {
-  if (!currentRun) return null;
+function getRunState(run) {
+  if (!run) return null;
   return {
-    id: currentRun.id,
-    folder: currentRun.folder,
-    status: currentRun.status,
-    attachments: currentRun.attachments?.map(serializeAtt),
-    prepared: currentRun.prepared?.map(serializePrepared),
-    bills: currentRun.bills?.map(serializeBill),
-    skipped: currentRun.skipped?.map(serializeSkipped),
-    removedIds: currentRun.removedIds || [],
-    includedSkippedIds: currentRun.includedSkippedIds || [],
-    result: currentRun.result,
-    error: currentRun.error,
+    id: run.id,
+    folder: run.folder,
+    status: run.status,
+    attachments: run.attachments?.map(a => serializeAtt(run, a)),
+    prepared: run.prepared?.map(p => serializePrepared(run, p)),
+    bills: run.bills?.map(b => serializeBill(run, b)),
+    skipped: run.skipped?.map(s => serializeSkipped(run, s)),
+    removedIds: run.removedIds || [],
+    includedSkippedIds: run.includedSkippedIds || [],
+    result: run.result,
+    error: run.error,
   };
 }
 
 // ── API ───────────────────────────────────────────────────────────────────────
 
-app.get('/api/status', (req, res) => res.json({ run: getRunState() }));
+app.get('/api/status', (req, res) => {
+  getToken(req, res);  // ensure session cookie is set on first visit
+  const { runId } = req.query;
+  if (runId) {
+    const run = activeRuns.get(runId);
+    return res.json({ run: run ? getRunState(run) : null });
+  }
+  res.json({ run: null });
+});
 
 // Report which env vars are set — UI uses this to show "configured in .env" hints.
 // Never returns actual values for sensitive fields.
@@ -142,7 +211,7 @@ app.get('/api/config', (req, res) => {
   const result = {};
   for (const k of KEYS) {
     if (SENSITIVE.has(k)) {
-      result[k] = !!process.env[k];  // boolean: is it set in .env?
+      result[k] = !!process.env[k];
     } else if (k === 'HEADLESS') {
       result[k] = process.env[k] !== undefined ? process.env[k] !== 'false' : null;
     } else if (k === 'LOOKBACK_DAYS') {
@@ -151,7 +220,33 @@ app.get('/api/config', (req, res) => {
       result[k] = process.env[k] || null;
     }
   }
+  result.isProd = isProd;
   res.json(result);
+});
+
+// ── Token management ─────────────────────────────────────────────────────────
+
+// Return (creating if needed) the caller's session token.
+app.get('/api/token', (req, res) => {
+  const token = getToken(req, res);
+  res.json({ token });
+});
+
+// Generate a brand-new token — caller loses access to old runs unless they saved their token.
+app.post('/api/token/new', (req, res) => {
+  const token = crypto.randomUUID();
+  res.cookie('userToken', token, { maxAge: TEN_YEARS_MS, httpOnly: false, sameSite: 'Strict', path: '/' });
+  res.json({ token });
+});
+
+// Restore a previously saved token — caller regains access to runs from that token.
+app.post('/api/token/restore', (req, res) => {
+  const { token } = req.body;
+  if (!token || typeof token !== 'string' || !token.trim())
+    return res.status(400).json({ error: 'token is required' });
+  const t = token.trim();
+  res.cookie('userToken', t, { maxAge: TEN_YEARS_MS, httpOnly: false, sameSite: 'Strict', path: '/' });
+  res.json({ token: t });
 });
 
 // Load images from local folder
@@ -171,7 +266,7 @@ app.post('/api/start', (req, res) => {
   if (files.length === 0)
     return res.status(400).json({ error: 'No image files found in folder' });
 
-  const runId  = `run_${Date.now()}`;
+  const runId  = `run_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
   const runDir = path.join(DOWNLOADS_DIR, runId);
   fs.mkdirSync(runDir, { recursive: true });
 
@@ -183,11 +278,13 @@ app.post('/api/start', (req, res) => {
     return { id: `img_${i}`, filename: name, path: dst };
   });
 
-  currentRun = { id: runId, folder: resolved, runDir, attachments, status: 'loaded', createdAt: new Date().toISOString() };
-  saveRunMeta(currentRun);
+  const token = getToken(req, res);
+  const run = { id: runId, folder: resolved, runDir, attachments, status: 'loaded', createdAt: new Date().toISOString(), userToken: token };
+  activeRuns.set(runId, run);
+  saveRunMeta(run);
   logger.info(`Run ${runId}: ${attachments.length} images from ${resolved}`);
 
-  res.json({ runId, attachments: attachments.map(serializeAtt) });
+  res.json({ runId, attachments: attachments.map(a => serializeAtt(run, a)) });
 });
 
 // Upload images directly from browser folder picker
@@ -201,84 +298,88 @@ app.post('/api/upload', upload.array('images'), (req, res) => {
   if (!imageFiles.length)
     return res.status(400).json({ error: 'No image files found in the selected folder' });
 
-  const runId  = `run_${Date.now()}`;
+  const runId  = `run_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
   const runDir = path.join(DOWNLOADS_DIR, runId);
   fs.mkdirSync(runDir, { recursive: true });
 
   // webkitRelativePath comes through as originalname "FolderName/file.jpg" — strip the folder prefix
   const attachments = imageFiles.map((file, i) => {
-    const filename = path.basename(file.originalname);  // original name for display only
+    const filename = path.basename(file.originalname);
     const ext = path.extname(filename).toLowerCase();
-    const diskName = `img_${i}${ext}`;                  // short name on disk → short cropped name
+    const diskName = `img_${i}${ext}`;
     const dst = path.join(runDir, diskName);
     fs.writeFileSync(dst, file.buffer);
     return { id: `img_${i}`, filename, path: dst };
   });
 
-  // Derive folder name from the first file's relative path
   const folderName = imageFiles[0].originalname.includes('/')
     ? imageFiles[0].originalname.split('/')[0]
     : 'uploaded';
 
-  currentRun = { id: runId, folder: folderName, runDir, attachments, status: 'loaded', createdAt: new Date().toISOString() };
-  saveRunMeta(currentRun);
+  const token = getToken(req, res);
+  const run = { id: runId, folder: folderName, runDir, attachments, status: 'loaded', createdAt: new Date().toISOString(), userToken: token };
+  activeRuns.set(runId, run);
+  saveRunMeta(run);
   logger.info(`Run ${runId}: ${attachments.length} images uploaded (${folderName})`);
 
-  res.json({ runId, folderName, attachments: attachments.map(serializeAtt) });
+  res.json({ runId, folderName, attachments: attachments.map(a => serializeAtt(run, a)) });
 });
 
 // Crop all images — async, streams progress via SSE
 app.post('/api/crop', async (req, res) => {
-  if (!currentRun) return res.status(400).json({ error: 'No active run' });
-  if (currentRun.status === 'cropping') return res.status(409).json({ error: 'Already cropping' });
-  const { config: clientConfig = {} } = req.body || {};
+  const { runId, config: clientConfig = {} } = req.body || {};
+  const run = getRun(runId, res);
+  if (!run) return;
+  if (run.status === 'cropping') return res.status(409).json({ error: 'Already cropping' });
   const apiKey = resolveConfig(clientConfig).ANTHROPIC_API_KEY;
 
   res.json({ ok: true });
-  currentRun.status = 'cropping';
-  currentRun.prepared = [];
+  run.status = 'cropping';
+  run.prepared = [];
 
-  const total = currentRun.attachments.length;
+  const total = run.attachments.length;
   for (let i = 0; i < total; i++) {
-    const att = currentRun.attachments[i];
+    const att = run.attachments[i];
     try {
       const croppedPath = await smartCrop(att.path, null, { apiKey });
       const prepared = { ...att, croppedPath, cropStatus: 'done' };
-      currentRun.prepared.push(prepared);
-      broadcast('crop_progress', {
+      run.prepared.push(prepared);
+      broadcastTo(runId, 'crop_progress', {
         id: att.id, filename: att.filename,
-        originalUrl: fileUrl(att.path), croppedUrl: fileUrl(croppedPath),
+        originalUrl: fileUrl(run, att.path), croppedUrl: fileUrl(run, croppedPath),
         done: i + 1, total,
       });
     } catch (err) {
       logger.warn(`Crop failed ${att.filename}: ${err.message}`);
-      currentRun.prepared.push({ ...att, croppedPath: att.path, cropStatus: 'error' });
-      broadcast('crop_error', { id: att.id, filename: att.filename, error: err.message, done: i + 1, total });
+      run.prepared.push({ ...att, croppedPath: att.path, cropStatus: 'error' });
+      broadcastTo(runId, 'crop_error', { id: att.id, filename: att.filename, error: err.message, done: i + 1, total });
     }
   }
 
-  currentRun.status = 'crop_done';
-  broadcast('crop_complete', { prepared: currentRun.prepared.map(serializePrepared) });
-  saveRunMeta(currentRun);
+  run.status = 'crop_done';
+  broadcastTo(runId, 'crop_complete', { prepared: run.prepared.map(p => serializePrepared(run, p)) });
+  saveRunMeta(run);
 });
 
 // AI re-crop single image with optional text feedback
 app.post('/api/recrop', async (req, res) => {
-  const { id, feedback, config: clientConfig = {} } = req.body;
-  if (!currentRun) return res.status(400).json({ error: 'No active run' });
+  const { runId, id, feedback, config: clientConfig = {} } = req.body;
+  const run = getRun(runId, res);
+  if (!run) return;
 
-  const att = currentRun.attachments.find(a => a.id === id);
+  const att = run.attachments.find(a => a.id === id);
   if (!att) return res.status(404).json({ error: 'Image not found' });
 
   try {
     const croppedPath = await smartCrop(att.path, feedback || null, { apiKey: resolveConfig(clientConfig).ANTHROPIC_API_KEY });
-    const croppedUrl  = fileUrl(croppedPath);
+    const croppedUrl  = fileUrl(run, croppedPath);
 
-    const idx = currentRun.prepared?.findIndex(p => p.id === id);
-    if (idx >= 0) currentRun.prepared[idx] = { ...currentRun.prepared[idx], croppedPath };
+    const idx = run.prepared?.findIndex(p => p.id === id);
+    if (idx >= 0) run.prepared[idx] = { ...run.prepared[idx], croppedPath };
 
-    saveRunMeta(currentRun);
+    saveRunMeta(run);
     res.json({ id, croppedUrl });
+    broadcastTo(runId, 'recrop_done', { id, croppedUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -286,10 +387,11 @@ app.post('/api/recrop', async (req, res) => {
 
 // Manual crop via pixel percentages — bypasses AI, uses sharp directly
 app.post('/api/manualcrop', async (req, res) => {
-  const { id, leftPct = 0, topPct = 0, rightPct = 0, bottomPct = 0 } = req.body;
-  if (!currentRun) return res.status(400).json({ error: 'No active run' });
+  const { runId, id, leftPct = 0, topPct = 0, rightPct = 0, bottomPct = 0 } = req.body;
+  const run = getRun(runId, res);
+  if (!run) return;
 
-  const att = currentRun.attachments.find(a => a.id === id);
+  const att = run.attachments.find(a => a.id === id);
   if (!att) return res.status(404).json({ error: 'Image not found' });
 
   try {
@@ -312,12 +414,13 @@ app.post('/api/manualcrop', async (req, res) => {
       .toFile(outPath);
 
     const cropTime = Date.now();
-    const croppedUrl = fileUrl(outPath) + `?t=${cropTime}`;
-    const idx = currentRun.prepared?.findIndex(p => p.id === id);
-    if (idx >= 0) currentRun.prepared[idx] = { ...currentRun.prepared[idx], croppedPath: outPath, cropTime };
+    const croppedUrl = fileUrl(run, outPath) + `?t=${cropTime}`;
+    const idx = run.prepared?.findIndex(p => p.id === id);
+    if (idx >= 0) run.prepared[idx] = { ...run.prepared[idx], croppedPath: outPath, cropTime };
 
-    saveRunMeta(currentRun);
+    saveRunMeta(run);
     res.json({ id, croppedUrl });
+    broadcastTo(runId, 'manualcrop_done', { id, croppedUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -325,15 +428,17 @@ app.post('/api/manualcrop', async (req, res) => {
 
 // Extract bill data — mode: 'ocr' (default, fast) or 'llm' (vision, accurate)
 app.post('/api/extract', async (req, res) => {
-  const { approvedIds, mode = 'ocr', config: clientConfig = {} } = req.body;
-  if (!currentRun) return res.status(400).json({ error: 'No active run' });
+  const { runId, approvedIds, mode = 'ocr', config: clientConfig = {} } = req.body;
+  const run = getRun(runId, res);
+  if (!run) return;
+  if (run.status === 'extracting') return res.status(409).json({ error: 'Already extracting' });
   if (!Array.isArray(approvedIds) || !approvedIds.length)
     return res.status(400).json({ error: 'approvedIds must be a non-empty array' });
 
   res.json({ ok: true });
-  currentRun.status = 'extracting';
+  run.status = 'extracting';
 
-  const toProcess = (currentRun.prepared || []).filter(p => approvedIds.includes(p.id));
+  const toProcess = (run.prepared || []).filter(p => approvedIds.includes(p.id));
   const total = toProcess.length;
   const bills = [], skipped = [];
 
@@ -341,22 +446,22 @@ app.post('/api/extract', async (req, res) => {
     // ── LLM vision mode: 4-concurrent Claude Vision calls ──────────────────
     const CONCURRENCY = 4;
     async function processOne(att) {
-      const croppedUrl = fileUrl(att.croppedPath) + (att.cropTime ? `?t=${att.cropTime}` : '');
+      const croppedUrl = fileUrl(run, att.croppedPath) + (att.cropTime ? `?t=${att.cropTime}` : '');
       try {
         const data = await extractBillData(att.croppedPath, { apiKey: resolveConfig(clientConfig).ANTHROPIC_API_KEY });
         if (data) {
           bills.push({ ...data, id: att.id, imagePath: att.croppedPath, filename: att.filename, cropTime: att.cropTime ?? null });
-          broadcast('extract_result', { id: att.id, type: 'bill', ...data, croppedUrl, filename: att.filename });
+          broadcastTo(runId, 'extract_result', { id: att.id, type: 'bill', ...data, croppedUrl, filename: att.filename });
         } else {
           skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath, cropTime: att.cropTime ?? null });
-          broadcast('extract_result', { id: att.id, type: 'skipped', croppedUrl, filename: att.filename });
+          broadcastTo(runId, 'extract_result', { id: att.id, type: 'skipped', croppedUrl, filename: att.filename });
         }
       } catch (err) {
         logger.error(`Extract ${att.filename}: ${err.message}`);
         skipped.push({ id: att.id, filename: att.filename, croppedPath: att.croppedPath, cropTime: att.cropTime ?? null, error: err.message });
-        broadcast('extract_result', { id: att.id, type: 'skipped', croppedUrl, filename: att.filename, error: err.message });
+        broadcastTo(runId, 'extract_result', { id: att.id, type: 'skipped', croppedUrl, filename: att.filename, error: err.message });
       }
-      broadcast('extract_progress', { done: bills.length + skipped.length, total });
+      broadcastTo(runId, 'extract_progress', { done: bills.length + skipped.length, total });
     }
     for (let i = 0; i < toProcess.length; i += CONCURRENCY) {
       await Promise.all(toProcess.slice(i, i + CONCURRENCY).map(processOne));
@@ -364,16 +469,11 @@ app.post('/api/extract', async (req, res) => {
 
   } else {
     // ── OCR mode: two phases ─────────────────────────────────────────────────
-    // Phase 1: All images OCR in parallel (worker pool). Each card appears as
-    //          soon as its OCR completes (ocr_result event), showing the raw text.
-    // Phase 2: One batch Claude text call. extract_result events then update the
-    //          cards with structured bill_no / bill_date / bill_amount.
-
-    broadcast('extract_progress', { done: 0, total, phase: 'ocr' });
+    broadcastTo(runId, 'extract_progress', { done: 0, total, phase: 'ocr' });
 
     const ocrResults = [];
     await Promise.all(toProcess.map(async att => {
-      const croppedUrl = fileUrl(att.croppedPath) + (att.cropTime ? `?t=${att.cropTime}` : '');
+      const croppedUrl = fileUrl(run, att.croppedPath) + (att.cropTime ? `?t=${att.cropTime}` : '');
       let text = '', confidence = 0;
       try {
         ({ text, confidence } = await ocrImage(att.croppedPath));
@@ -384,11 +484,10 @@ app.post('/api/extract', async (req, res) => {
         logger.warn(`  OCR failed ${att.filename}: ${err.message}`);
       }
       ocrResults.push({ id: att.id, text, confidence, ocrOk: text.length >= 40 });
-      broadcast('ocr_result', { id: att.id, filename: att.filename, croppedUrl, ocrText: text, ocrConfidence: confidence });
+      broadcastTo(runId, 'ocr_result', { id: att.id, filename: att.filename, croppedUrl, ocrText: text, ocrConfidence: confidence });
     }));
 
-    // Phase 2: batch Claude extraction
-    broadcast('extract_progress', { done: 0, total, phase: 'claude' });
+    broadcastTo(runId, 'extract_progress', { done: 0, total, phase: 'claude' });
     const result = await extractFromOCR(ocrResults, toProcess, { autoMode: false, apiKey: resolveConfig(clientConfig).ANTHROPIC_API_KEY });
 
     for (const b of result.bills) {
@@ -410,97 +509,101 @@ app.post('/api/extract', async (req, res) => {
 
     for (const b of bills) {
       const att = toProcess.find(p => p.id === b.id);
-      const croppedUrl = fileUrl(b.imagePath) + (att?.cropTime ? `?t=${att.cropTime}` : '');
-      broadcast('extract_result', { id: b.id, type: 'bill', bill_no: b.bill_no,
+      const croppedUrl = fileUrl(run, b.imagePath) + (att?.cropTime ? `?t=${att.cropTime}` : '');
+      broadcastTo(runId, 'extract_result', { id: b.id, type: 'bill', bill_no: b.bill_no,
         bill_date: b.bill_date, bill_amount: b.bill_amount, croppedUrl,
         filename: b.filename, ocrConfidence: b.ocrConfidence, ocrText: b.ocrText });
     }
     for (const s of skipped) {
       const att = toProcess.find(p => p.id === s.id);
-      const croppedUrl = fileUrl(s.croppedPath || '') + (att?.cropTime ? `?t=${att.cropTime}` : '');
-      broadcast('extract_result', { id: s.id, type: 'skipped', croppedUrl,
+      const croppedUrl = fileUrl(run, s.croppedPath || '') + (att?.cropTime ? `?t=${att.cropTime}` : '');
+      broadcastTo(runId, 'extract_result', { id: s.id, type: 'skipped', croppedUrl,
         filename: s.filename, error: s.error, ocrConfidence: s.ocrConfidence, ocrText: s.ocrText });
     }
-    broadcast('extract_progress', { done: total, total });
+    broadcastTo(runId, 'extract_progress', { done: total, total });
   }
 
-  currentRun.bills   = bills;
-  currentRun.skipped = skipped;
-  currentRun.status  = 'extracted';
-  broadcast('extract_complete', {
-    bills: bills.map(serializeBill),
-    skipped: skipped.map(serializeSkipped),
+  run.bills   = bills;
+  run.skipped = skipped;
+  run.status  = 'extracted';
+  broadcastTo(runId, 'extract_complete', {
+    bills: bills.map(b => serializeBill(run, b)),
+    skipped: skipped.map(s => serializeSkipped(run, s)),
   });
-  saveRunMeta(currentRun);
+  saveRunMeta(run);
 });
 
 // Re-extract a single bill using LLM vision (called from Step 3 review)
 app.post('/api/reextract', async (req, res) => {
-  const { id, config: clientConfig = {} } = req.body;
-  if (!currentRun) return res.status(400).json({ error: 'No active run' });
+  const { runId, id, config: clientConfig = {} } = req.body;
+  const run = getRun(runId, res);
+  if (!run) return;
 
-  const att = (currentRun.prepared || []).find(p => p.id === id);
+  const att = (run.prepared || []).find(p => p.id === id);
   if (!att) return res.status(404).json({ error: 'Image not found' });
 
   try {
     const data = await extractBillData(att.croppedPath, { apiKey: resolveConfig(clientConfig).ANTHROPIC_API_KEY });
     if (!data) return res.json({ id, found: false });
 
-    // Update in-memory bills list
-    const existing = currentRun.bills?.find(b => b.id === id);
+    const existing = run.bills?.find(b => b.id === id);
     if (existing) {
       Object.assign(existing, data);
     } else {
-      currentRun.bills = currentRun.bills || [];
-      currentRun.bills.push({ ...data, id, imagePath: att.croppedPath, filename: att.filename });
-      currentRun.skipped = (currentRun.skipped || []).filter(s => s.id !== id);
+      run.bills = run.bills || [];
+      run.bills.push({ ...data, id, imagePath: att.croppedPath, filename: att.filename });
+      run.skipped = (run.skipped || []).filter(s => s.id !== id);
     }
 
-    saveRunMeta(currentRun);
+    saveRunMeta(run);
     res.json({ id, found: true, bill_no: data.bill_no, bill_date: data.bill_date, bill_amount: data.bill_amount });
+    broadcastTo(runId, 'reextract_done', { id, bill_no: data.bill_no, bill_date: data.bill_date, bill_amount: data.bill_amount });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Save user-edited bill data + removed/included sets (called before portal submit and after edits)
+// Save user-edited bill data + removed/included sets
 app.put('/api/bills', (req, res) => {
-  if (!currentRun) return res.status(400).json({ error: 'No active run' });
-  const { bills, skipped, removedIds, includedSkippedIds } = req.body;
+  const { runId, bills, skipped, removedIds, includedSkippedIds } = req.body;
+  const run = getRun(runId, res);
+  if (!run) return;
 
   if (Array.isArray(bills)) {
-    currentRun.bills = bills.map(b => {
-      const orig = (currentRun.bills || []).find(o => o.id === b.id) || {};
+    run.bills = bills.map(b => {
+      const orig = (run.bills || []).find(o => o.id === b.id) || {};
       return { ...orig, bill_no: b.bill_no, bill_date: b.bill_date, bill_amount: b.bill_amount };
     });
   }
   if (Array.isArray(skipped)) {
-    currentRun.skipped = (currentRun.skipped || []).map(s => {
+    run.skipped = (run.skipped || []).map(s => {
       const edited = skipped.find(e => e.id === s.id);
       return edited ? { ...s, bill_no: edited.bill_no, bill_date: edited.bill_date, bill_amount: edited.bill_amount } : s;
     });
   }
-  if (Array.isArray(removedIds))          currentRun.removedIds = removedIds;
-  if (Array.isArray(includedSkippedIds))  currentRun.includedSkippedIds = includedSkippedIds;
+  if (Array.isArray(removedIds))          run.removedIds = removedIds;
+  if (Array.isArray(includedSkippedIds))  run.includedSkippedIds = includedSkippedIds;
 
-  saveRunMeta(currentRun);
+  saveRunMeta(run);
   res.json({ ok: true });
 });
 
 // Submit to portal — async
 app.post('/api/submit', async (req, res) => {
-  const { bills: edited, config: clientConfig = {} } = req.body;
-  if (!currentRun) return res.status(400).json({ error: 'No active run' });
+  const { runId, bills: edited, config: clientConfig = {} } = req.body;
+  const run = getRun(runId, res);
+  if (!run) return;
+  if (run.status === 'submitting') return res.status(409).json({ error: 'Already submitting' });
   if (!Array.isArray(edited) || !edited.length)
     return res.status(400).json({ error: 'bills must be a non-empty array' });
 
   res.json({ ok: true });
-  currentRun.status = 'submitting';
-  broadcast('submit_start', { total: edited.length });
+  run.status = 'submitting';
+  broadcastTo(runId, 'submit_start', { total: edited.length });
 
   const lookup = [
-    ...(currentRun.bills   || []),
-    ...(currentRun.skipped || []).map(s => ({ ...s, imagePath: s.croppedPath })),
+    ...(run.bills   || []),
+    ...(run.skipped || []).map(s => ({ ...s, imagePath: s.croppedPath })),
   ];
 
   const billsWithPaths = edited.map(b => {
@@ -509,49 +612,51 @@ app.post('/api/submit', async (req, res) => {
   }).filter(b => b.imagePath);
 
   const killController = new AbortController();
-  currentRun.killController = killController;
-  currentRun.paused = false;
+  run.killController = killController;
+  run.paused = false;
+  run._retryCtx = null;
 
-  // waitIfPaused: portal calls this between steps; resolves instantly or waits until resumed
   function waitIfPaused() {
-    return currentRun?.paused ? (currentRun._pausePromise || Promise.resolve()) : Promise.resolve();
+    return run?.paused ? (run._pausePromise || Promise.resolve()) : Promise.resolve();
   }
 
-  // waitForConfirm: portal calls this after all bills are saved; waits for POST /api/submit/confirm
   function waitForConfirm() {
-    return new Promise(resolve => { currentRun._confirmResolve = resolve; });
+    return new Promise(resolve => { run._confirmResolve = resolve; });
   }
 
   try {
     const result = await submitReimbursementClaims(billsWithPaths, {
-      broadcast,
+      broadcast: (type, payload) => broadcastTo(runId, type, payload),
       signal: killController.signal,
       waitIfPaused,
       waitForConfirm,
+      onRetryCtx: (ctx) => { run._retryCtx = ctx; },
       config: clientConfig,
     });
-    currentRun.result = result;
-    currentRun.status = result.success ? 'done' : 'error';
-    saveRunMeta(currentRun);
-    broadcast('submit_complete', { result });
+    run.result = result;
+    run.status = result.success ? 'done' : 'error';
+    saveRunMeta(run);
+    broadcastTo(runId, 'submit_complete', { result });
   } catch (err) {
-    currentRun.status = 'error';
-    currentRun.error  = err.message;
-    saveRunMeta(currentRun);
-    broadcast('submit_error', { error: err.message });
+    run.status = 'error';
+    run.error  = err.message;
+    saveRunMeta(run);
+    broadcastTo(runId, 'submit_error', { error: err.message });
   } finally {
-    if (currentRun) {
-      currentRun.killController = null;
-      if (currentRun._confirmResolve) { currentRun._confirmResolve(); currentRun._confirmResolve = null; }
-      if (currentRun._pauseResolve) { currentRun._pauseResolve(); currentRun._pauseResolve = null; }
-    }
+    run.killController = null;
+    run._retryCtx = null;
+    if (run._confirmResolve) { run._confirmResolve(); run._confirmResolve = null; }
+    if (run._pauseResolve)   { run._pauseResolve();   run._pauseResolve  = null; }
   }
 });
 
 // Kill an in-progress submission
 app.post('/api/submit/kill', (req, res) => {
-  if (currentRun?.killController) {
-    currentRun.killController.abort();
+  const { runId } = req.body || {};
+  const run = getRun(runId, res);
+  if (!run) return;
+  if (run.killController) {
+    run.killController.abort();
     res.json({ ok: true });
   } else {
     res.json({ ok: false, message: 'No active submission' });
@@ -560,58 +665,67 @@ app.post('/api/submit/kill', (req, res) => {
 
 // Pause / resume submission (honoured between bill entries)
 app.post('/api/submit/pause', (req, res) => {
-  if (!currentRun) return res.status(400).json({ ok: false });
-  if (!currentRun.paused) {
-    currentRun.paused = true;
-    // Create a latch that portal's waitIfPaused() will wait on
+  const { runId } = req.body || {};
+  const run = getRun(runId, res);
+  if (!run) return;
+  if (!run.paused) {
+    run.paused = true;
     let resolve;
     const promise = new Promise(r => { resolve = r; });
-    currentRun._pausePromise = promise;
-    currentRun._pauseResolve = resolve;
-    broadcast('submit_paused', { paused: true });
+    run._pausePromise = promise;
+    run._pauseResolve = resolve;
+    broadcastTo(runId, 'submit_paused', { paused: true });
   } else {
-    currentRun.paused = false;
-    if (currentRun._pauseResolve) { currentRun._pauseResolve(); }
-    currentRun._pausePromise = null;
-    currentRun._pauseResolve = null;
-    broadcast('submit_paused', { paused: false });
+    run.paused = false;
+    if (run._pauseResolve) { run._pauseResolve(); }
+    run._pausePromise = null;
+    run._pauseResolve = null;
+    broadcastTo(runId, 'submit_paused', { paused: false });
   }
-  res.json({ ok: true, paused: currentRun.paused });
+  res.json({ ok: true, paused: run.paused });
 });
 
 // Confirm final submit (called from UI after user reviews portal entries)
 app.post('/api/submit/confirm', (req, res) => {
-  if (currentRun?._confirmResolve) {
-    currentRun._confirmResolve();
-    currentRun._confirmResolve = null;
+  const { runId } = req.body || {};
+  const run = getRun(runId, res);
+  if (!run) return;
+  if (run._confirmResolve) {
+    run._confirmResolve();
+    run._confirmResolve = null;
   }
-  broadcast('submit_confirmed');
+  broadcastTo(runId, 'submit_confirmed');
   res.json({ ok: true });
 });
 
 // Retry specific failed bills — portal page is still open during confirm gate
 app.post('/api/submit/retry-failed', async (req, res) => {
-  const { bills } = req.body;
+  const { runId, bills } = req.body;
+  const run = getRun(runId, res);
+  if (!run) return;
   if (!Array.isArray(bills) || !bills.length) return res.status(400).json({ error: 'bills required' });
   res.json({ ok: true });  // respond immediately; result comes via SSE
   try {
-    await retryFailedBills(bills);
+    await retryFailedBills(bills, run._retryCtx);
   } catch (err) {
-    broadcast('submit_progress', { id: 'retry_error', step: 'error', label: `Retry error: ${err.message}`, status: 'error' });
+    broadcastTo(runId, 'submit_progress', { id: 'retry_error', step: 'error', label: `Retry error: ${err.message}`, status: 'error' });
   }
 });
 
-// List all saved runs (newest first)
+// List all saved runs for this user token (newest first)
 app.get('/api/runs', (req, res) => {
+  const token = getToken(req, res);
   if (!fs.existsSync(DOWNLOADS_DIR)) return res.json([]);
   try {
     const runs = fs.readdirSync(DOWNLOADS_DIR)
-      .filter(name => /^run_\d+$/.test(name))
+      .filter(name => /^run_[a-z0-9_]+$/.test(name))
       .map(name => {
         const metaPath = path.join(DOWNLOADS_DIR, name, 'meta.json');
         if (!fs.existsSync(metaPath)) return null;
         try {
           const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          // Runs with no stored token are legacy — visible to everyone.
+          if (meta.userToken && meta.userToken !== token) return null;
           return {
             id: meta.id,
             folder: meta.folder,
@@ -630,34 +744,49 @@ app.get('/api/runs', (req, res) => {
   }
 });
 
-// Activate a saved run as currentRun
+// Activate a saved run — loads from disk into activeRuns (verifies token ownership)
 app.post('/api/runs/:id/activate', (req, res) => {
+  const token = getToken(req, res);
   const runDir = path.join(DOWNLOADS_DIR, req.params.id);
   const metaPath = path.join(runDir, 'meta.json');
   if (!fs.existsSync(metaPath)) return res.status(404).json({ error: 'Run not found' });
   try {
     const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-    // Don't leave it stuck in submitting state on reload
+    // Runs with no stored token are legacy — allow any token to activate them.
+    if (meta.userToken && meta.userToken !== token)
+      return res.status(403).json({ error: 'This run belongs to a different session' });
     if (meta.status === 'submitting') meta.status = 'extracted';
-    currentRun = { ...meta, killController: null, paused: false };
-    res.json({ run: getRunState() });
+    const run = { ...meta, killController: null, paused: false };
+    activeRuns.set(run.id, run);
+    res.json({ run: getRunState(run) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Delete a saved run (removes directory and clears currentRun if it matches)
+// Delete a saved run (removes directory and evicts from activeRuns; verifies ownership)
 app.delete('/api/runs/:id', (req, res) => {
+  const token = getToken(req, res);
   const { id } = req.params;
   const runDir = path.join(DOWNLOADS_DIR, id);
   if (!fs.existsSync(runDir)) return res.status(404).json({ error: 'Run not found' });
-  if (currentRun?.id === id) currentRun = null;
+  try {
+    const metaPath = path.join(runDir, 'meta.json');
+    if (fs.existsSync(metaPath)) {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      if (meta.userToken && meta.userToken !== token)
+        return res.status(403).json({ error: 'This run belongs to a different session' });
+    }
+  } catch {}
+  activeRuns.delete(id);
   fs.rmSync(runDir, { recursive: true, force: true });
   res.json({ ok: true });
 });
 
+// Deactivate a run from this client's view (removes from activeRuns but keeps on disk)
 app.delete('/api/run', (req, res) => {
-  currentRun = null;
+  const runId = req.query.runId || req.body?.runId;
+  if (runId) activeRuns.delete(runId);
   res.json({ ok: true });
 });
 
@@ -708,8 +837,6 @@ function migrateOldRuns() {
       });
 
       const hasCrops = prepared.some(p => p.cropStatus === 'done');
-
-      // Derive a display folder name from the run timestamp
       const dateStr = isNaN(ts) ? '' : new Date(ts).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
       const folder = `Run from ${dateStr}`;
 

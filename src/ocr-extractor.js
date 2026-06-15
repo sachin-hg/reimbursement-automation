@@ -149,22 +149,23 @@ async function ocrAllImages(preparedAttachments) {
 // ── Step 2: Batch Claude text extraction ──────────────────────────────────────
 // Sends OCR texts to Claude in one call. Low-confidence images are included and
 // Claude handles the noise — human reviews results and can re-extract with LLM.
-// In auto mode, low-confidence images are skipped entirely (no LLM fallback).
+// In auto mode, low-confidence images are skipped (or fall back to LLM vision if llmFallback is supplied).
 
-async function extractFromOCR(ocrResults, preparedAttachments, { autoMode = false, apiKey } = {}) {
+async function extractFromOCR(ocrResults, preparedAttachments, { autoMode = false, apiKey, llmFallback } = {}) {
   const attById = Object.fromEntries(preparedAttachments.map(a => [a.id, a]));
 
-  // Auto mode: only process high-confidence images, skip the rest silently.
-  // Human mode: send ALL images with readable text to Claude (including low-confidence).
+  // Auto mode: only process high-confidence images, send the rest to llmFallback (or skip).
+  // Human mode: send ALL images with readable text to Claude text batch (including low-confidence).
   const toExtract = ocrResults.filter(r => r.ocrOk &&
     (autoMode ? r.confidence >= LOW_CONFIDENCE_THRESHOLD : true));
   const noText    = ocrResults.filter(r => !r.ocrOk);
+  const lowConf   = autoMode ? ocrResults.filter(r => r.ocrOk && r.confidence < LOW_CONFIDENCE_THRESHOLD) : [];
 
   if (autoMode) {
-    ocrResults.filter(r => !r.ocrOk || r.confidence < LOW_CONFIDENCE_THRESHOLD)
-      .forEach(r => logger.warn(`  Auto-skip ${attById[r.id]?.filename}: low/no confidence (${r.confidence})`));
+    [...noText, ...lowConf].forEach(r =>
+      logger.warn(`  Low/no OCR confidence ${attById[r.id]?.filename} (${r.confidence})${llmFallback ? ' — will try LLM vision' : ' — skipping'}`)
+    );
   } else {
-    const lowConf = ocrResults.filter(r => r.ocrOk && r.confidence < LOW_CONFIDENCE_THRESHOLD);
     if (lowConf.length) logger.info(`  ${lowConf.length} low-confidence image(s) included in batch — human will review`);
   }
 
@@ -243,11 +244,45 @@ Tips:
     }
   }
 
-  // ── No-text images go to skipped; user can re-extract with LLM manually ──
-  for (const r of noText) {
-    const att = attById[r.id];
-    skipped.push({ id: r.id, filename: att?.filename, croppedPath: att?.croppedPath,
-      error: 'OCR returned no readable text' });
+  // ── LLM vision fallback for low/no-confidence images ────────────────────────
+  // Used when the caller supplies llmFallback (e.g. daemon mode, CLI without --human).
+  // Images with no OCR text OR low confidence are sent to the vision model directly.
+  const needFallback = [...noText, ...lowConf];
+  if (llmFallback && needFallback.length) {
+    logger.info(`LLM vision fallback for ${needFallback.length} image(s)…`);
+    for (const r of needFallback) {
+      const att = attById[r.id];
+      if (!att) continue;
+      try {
+        const data = await llmFallback(att.croppedPath);
+        if (data) {
+          logger.info(`  ✓ LLM fallback ${att.filename}: No: ${data.bill_no} | Date: ${data.bill_date} | ₹${data.bill_amount}`);
+          bills.push({ id: att.id, filename: att.filename, imagePath: att.croppedPath,
+            bill_no: data.bill_no, bill_date: data.bill_date, bill_amount: data.bill_amount });
+        } else {
+          skipped.push({ id: r.id, filename: att.filename, croppedPath: att.croppedPath,
+            error: 'LLM vision could not extract valid data' });
+        }
+      } catch (err) {
+        logger.warn(`  LLM fallback failed ${att.filename}: ${err.message}`);
+        skipped.push({ id: r.id, filename: att.filename, croppedPath: att.croppedPath, error: err.message });
+      }
+    }
+  } else {
+    // No fallback — put all no-text images into skipped
+    for (const r of noText) {
+      const att = attById[r.id];
+      skipped.push({ id: r.id, filename: att?.filename, croppedPath: att?.croppedPath,
+        error: 'OCR returned no readable text' });
+    }
+    // In autoMode without fallback, low-confidence images were already warned above;
+    // they're not in toExtract so they silently end up absent from both bills and skipped.
+    // Add them to skipped so callers know about them.
+    for (const r of lowConf) {
+      const att = attById[r.id];
+      skipped.push({ id: r.id, filename: att?.filename, croppedPath: att?.croppedPath,
+        error: `Low OCR confidence (${r.confidence})` });
+    }
   }
 
   return { bills, skipped };

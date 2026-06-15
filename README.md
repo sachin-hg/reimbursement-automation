@@ -105,20 +105,20 @@ The recommended way. A local server + React frontend with live progress, crop re
 # Terminal 1 — API server (port 3333)
 npm run server
 
-# Terminal 2 — Vite dev server with hot reload (port 5173)
+# Terminal 2 — Vite dev server with hot reload (port 5180)
 npm run web:dev
 
 # Or both in one terminal:
 npm run dev
 
-# Open: http://localhost:5173
+# Open: http://localhost:5180
 ```
 
 For production (serves built assets from the API server):
 
 ```bash
 npm run web:build
-npm run server
+NODE_ENV=production node src/server.js
 # Open: http://localhost:3333
 ```
 
@@ -132,6 +132,32 @@ npm run server
 ### Recent runs
 
 The homepage shows all previous runs. Click **Continue** to resume a run — edits, crops, and extracted data are all restored. Runs are stored under `downloads/run_<timestamp>/`.
+
+### Session tokens
+
+Each browser gets a persistent session token (UUID stored in a 10-year cookie). Runs are scoped to that token — other browsers cannot see your runs.
+
+**Settings ⚙ → Session** lets you:
+
+| Action | What it does |
+|---|---|
+| **Copy token** | Save your token to a notepad for safekeeping |
+| **Restore** | Paste a saved token to reclaim access to old runs |
+| **New session →** | Generate a fresh token (previous runs stay on disk but become inaccessible until restored) |
+
+**Seeding legacy runs** (one-time, if you had runs before token support was added):
+
+```bash
+node scripts/seed-token.js
+```
+
+Prints a token and stamps all un-tokenised runs with it. Paste that token into Settings → Restore.
+
+### Production mode
+
+When the server is started with `NODE_ENV=production`:
+- Browser always runs **headless** — the headless toggle is hidden in the UI and cannot be overridden by client config.
+- All other settings behave identically.
 
 ---
 
@@ -173,6 +199,7 @@ node src/cli.js [options]
 | `--password <pwd>` | `-p` | `PORTAL_PASSWORD` | Portal password |
 | `--headless` / `--no-headless` | — | `HEADLESS` | Run browser headless or visible |
 | `--gmail-label <label>` | `-l` | `GMAIL_LABEL` | Gmail label to search |
+| `--token <uuid>` | `-t` | saved in `~/.reimbursement-automation-token` | Session token — links this CLI run to your browser session so the run appears in the Web UI |
 
 ### Examples
 
@@ -206,6 +233,21 @@ node src/cli.js --folder ~/bills --headless
 
 # Use a different Gmail label
 node src/cli.js --email you@gmail.com --gmail-label "Fuel Bills"
+
+# Link CLI run to your browser session (run appears in Web UI Recent Runs)
+node src/cli.js --folder ~/bills --token 8a291261-30b1-40e1-900e-ca985071f450
+```
+
+### Session token (CLI ↔ Web UI)
+
+The CLI automatically saves a session token to `~/.reimbursement-automation-token` on first run. Pass the same token you use in the browser with `--token` and CLI-created runs will appear in the Web UI's Recent Runs list.
+
+```bash
+# View your CLI token
+cat ~/.reimbursement-automation-token
+
+# Use a specific token (also saves it for future runs)
+node src/cli.js --folder ~/bills --token <your-token>
 ```
 
 ### What `--human` does
@@ -217,7 +259,9 @@ node src/cli.js --email you@gmail.com --gmail-label "Fuel Bills"
 
 ### Output
 
-Each run is saved to `downloads/run_<timestamp>/` with a `meta.json` file. Runs are visible in the Web UI under **Recent Runs**.
+Each run is saved to `downloads/run_<timestamp>_<hex>/` with a `meta.json` file. Runs are visible in the Web UI under **Recent Runs**.
+
+Multiple CLI runs (and Web UI runs) can be in-flight at the same time — each run is fully isolated with its own state, SSE channel, and Puppeteer session.
 
 ---
 
@@ -335,6 +379,7 @@ In the **Web UI**, toggle between modes using the **Extract via: OCR / LLM Visio
 │   ├── cli.js             # CLI pipeline (manual trigger)
 │   ├── index.js           # IMAP daemon (automated trigger)
 │   ├── portal.js          # Puppeteer portal automation
+│   ├── config.js          # Config resolver — merges .env, client overrides, prod defaults
 │   ├── image-processor.js # Smart crop (Claude Haiku + sharp)
 │   ├── bill-extractor.js  # Claude Vision extraction (LLM mode)
 │   ├── ocr-extractor.js   # Tesseract OCR + Claude text extraction (OCR mode)
@@ -342,18 +387,29 @@ In the **Web UI**, toggle between modes using the **Extract via: OCR / LLM Visio
 │   ├── imap-watcher.js    # IMAP IDLE connection (daemon)
 │   ├── mailer.js          # SMTP reply sender (daemon)
 │   └── logger.js          # Winston logger
+├── scripts/
+│   └── seed-token.js      # One-shot: stamp legacy runs with a session token
 ├── web/                   # React + Vite frontend
 │   └── src/
 │       ├── App.jsx        # Main app shell, phase state machine
 │       ├── api.js         # Fetch wrappers for all API endpoints
-│       └── components/    # StepBar, Step1–4 panels, BillCard, RunList, …
+│       ├── useSSE.js      # SSE hook — reconnects per-run on runId change
+│       └── components/    # StepBar, Step1–4 panels, BillCard, ImageCropCard, RunList, SettingsPanel, …
 ├── downloads/             # Persistent run storage (one dir per run)
-│   └── run_<timestamp>/
-│       ├── meta.json      # Full run state — bills, crops, results
-│       └── img_*.jpg      # Cropped receipt images
+│   └── run_<timestamp>_<hex>/
+│       ├── meta.json      # Full run state — bills, crops, token, results
+│       └── img_*.jpg      # Original + cropped receipt images
 ├── .browser-profile/      # Persistent Chrome session for Gmail CLI mode
 └── .env                   # Your configuration (never commit this)
 ```
+
+---
+
+## Privacy
+
+- **Credentials are never stored on the server.** Portal username/password are sent only during an active submit call and used exclusively to drive the browser session. They are not logged or persisted.
+- **No private data is sent to the LLM.** Only receipt images (cropped JPEGs) are sent to Claude for data extraction. Your credentials, employee ID, or personal details never leave your machine toward any AI model.
+- **Session tokens are local.** The UUID token identifying your runs is stored only in your browser cookie and (for the CLI) in `~/.reimbursement-automation-token`. The server never transmits it outside your network.
 
 ---
 
@@ -363,7 +419,7 @@ In the **Web UI**, toggle between modes using the **Extract via: OCR / LLM Visio
 The date field didn't register. Use the **Retry Failed Bills** button in the confirmation gate (Web UI) or re-run from Step 3 with the correct date format (`DD/MM/YYYY`).
 
 **Extraction shows wrong amount**
-Edit the amount field directly in Step 3 (Web UI) or check the OCR confidence badge. Low-confidence images (below ~60%) are flagged — click **Re-extract with LLM** on the card for better accuracy.
+Edit the amount field directly in Step 3 (Web UI) or check the OCR confidence badge. Low-confidence images (below ~55%) are flagged — click **Re-extract with LLM** on the card for better accuracy.
 
 **Extracting spinner doesn't disappear**
 SSE connection dropped mid-extraction. Refresh the page — the server restores run state from `meta.json` and shows the correct completed state.
@@ -373,3 +429,9 @@ Delete `.browser-profile/` and re-run — Chrome will prompt you to log in again
 
 **IMAP daemon: can't find label folder**
 Run `node -e "require('./src/imap-watcher').listFolders()"` and match the exact folder path. Gmail often nests labels differently from what the UI shows.
+
+**Recent Runs shows nothing / wrong runs**
+Your browser has a different session token than the runs on disk. Go to Settings ⚙ → Session, copy your token, and check whether it matches what's in `downloads/run_*/meta.json`. To reassign all un-tokenised runs to a new token, run `node scripts/seed-token.js` and paste the printed token into Settings → Restore.
+
+**CLI runs don't appear in Web UI**
+The CLI uses a separate token stored in `~/.reimbursement-automation-token`. Either pass `--token <browser-token>` to the CLI, or copy the CLI token and paste it into Settings → Restore in the browser.

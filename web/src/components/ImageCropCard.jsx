@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from 'react';
+import { useState, useRef, useCallback, useEffect } from 'react';
 import { api } from '../api.js'; // used by applyManualCrop → api.manualcrop
 
 export default function ImageCropCard({ item, decision, onDecide, confidenceBadge }) {
@@ -6,6 +6,14 @@ export default function ImageCropCard({ item, decision, onDecide, confidenceBadg
   const [loading, setLoading]   = useState(false);
   const [croppedUrl, setCroppedUrl] = useState(item.croppedUrl);
   const [cropReady, setCropReady]   = useState(!!item.croppedUrl);
+
+  // Sync crop URL when another SSE subscriber triggers a crop on this same item
+  useEffect(() => {
+    if (item.croppedUrl && !loading) {
+      setCroppedUrl(item.croppedUrl);
+      setCropReady(true);
+    }
+  }, [item.croppedUrl]);
 
   // Manual drag-select state
   const imgRef    = useRef(null);

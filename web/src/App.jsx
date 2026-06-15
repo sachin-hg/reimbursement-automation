@@ -38,7 +38,7 @@ export default function App() {
 
   // On mount: try to restore run from URL path or server state
   useEffect(() => {
-    const match = window.location.pathname.match(/^\/run\/(run_\d+)$/);
+    const match = window.location.pathname.match(/^\/run\/(run_[a-z0-9_]+)$/);
     if (match) {
       const id = match[1];
       api.activateRun(id).then(({ run }) => restoreRun(run)).catch(() => navigate('/'));
@@ -53,7 +53,7 @@ export default function App() {
   // Handle browser back/forward
   useEffect(() => {
     function onPopState() {
-      const match = window.location.pathname.match(/^\/run\/(run_\d+)$/);
+      const match = window.location.pathname.match(/^\/run\/(run_[a-z0-9_]+)$/);
       if (match) {
         const id = match[1];
         api.activateRun(id).then(({ run }) => restoreRun(run)).catch(() => {});
@@ -89,8 +89,15 @@ export default function App() {
     }
   }
 
-  // SSE event handlers
-  useSSE({
+  // Keep api._runId in sync whenever React runId state changes.
+  // This ensures all subsequent api calls are scoped to the active run,
+  // and useSSE reconnects to the correct /api/events?runId= channel.
+  useEffect(() => {
+    api.setRunId(runId);
+  }, [runId]);
+
+  // SSE event handlers — scoped to the active runId (reconnects automatically on change)
+  useSSE(runId, {
     state: ({ run }) => restoreRun(run),
 
     crop_progress: ({ id, filename, originalUrl, croppedUrl, done, total }) => {
@@ -212,6 +219,16 @@ export default function App() {
     submit_error: ({ error }) => {
       setSubmitResult({ success: false });
       setSubmitError(error);
+    },
+
+    recrop_done: ({ id, croppedUrl }) => {
+      setPrepared(prev => prev.map(p => p.id === id ? { ...p, croppedUrl } : p));
+    },
+    manualcrop_done: ({ id, croppedUrl }) => {
+      setPrepared(prev => prev.map(p => p.id === id ? { ...p, croppedUrl } : p));
+    },
+    reextract_done: ({ id, bill_no, bill_date, bill_amount }) => {
+      setBills(prev => prev.map(b => b.id === id ? { ...b, bill_no, bill_date, bill_amount } : b));
     },
   });
 
