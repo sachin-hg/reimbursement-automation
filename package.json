@@ -1,0 +1,32 @@
+{
+  "name": "reimbursement-automation",
+  "version": "1.0.0",
+  "description": "Automated petrol bill reimbursement: IMAP IDLE trigger → Claude Vision OCR → Puppeteer portal",
+  "main": "src/cli.js",
+  "scripts": {
+    "start": "node src/cli.js",
+    "server": "node src/server.js",
+    "web:dev": "cd web && npm run dev",
+    "web:build": "cd web && npm run build",
+    "dev": "concurrently \"npm run server\" \"npm run web:dev\"",
+    "test-extract": "node scripts/test-extract.js",
+    "test-portal": "node scripts/test-portal.js",
+    "test-preprocess": "node scripts/test-preprocess.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "imapflow": "^1.0.169",
+    "mailparser": "^3.7.1",
+    "multer": "^2.1.1",
+    "nodemailer": "^6.9.14",
+    "puppeteer": "^25.0.4",
+    "sharp": "^0.33.4",
+    "tesseract.js": "^7.0.0",
+    "winston": "^3.13.0"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}
