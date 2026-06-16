@@ -7,7 +7,7 @@ const fs = require('fs');
 const sharp = require('sharp');
 const { smartCrop } = require('./image-processor');
 const { extractBillData } = require('./bill-extractor');
-const { ocrImage, extractFromOCR, LOW_CONFIDENCE_THRESHOLD } = require('./ocr-extractor');
+const { ocrImage, extractFromOCR, terminateWorker, LOW_CONFIDENCE_THRESHOLD } = require('./ocr-extractor');
 const { submitReimbursementClaims, retryFailedBills } = require('./portal');
 const { resolveConfig, isProd } = require('./config');
 const logger = require('./logger');
@@ -559,6 +559,10 @@ app.post('/api/extract', async (req, res) => {
     skipped: skipped.map(s => serializeSkipped(run, s)),
   });
   saveRunMeta(run);
+
+  // Free Tesseract WASM workers — they hold ~25MB each and are only needed during extraction.
+  // The pool re-initialises lazily on the next extract call.
+  terminateWorker().catch(() => {});
 });
 
 // Re-extract a single bill using LLM vision (called from Step 3 review)

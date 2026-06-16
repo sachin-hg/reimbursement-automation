@@ -20,4 +20,4 @@ cmds = [
 cmds = ["cd web && npm run build"]
 
 [start]
-cmd = "node src/server.js"
+cmd = "node --max-old-space-size=400 src/server.js"

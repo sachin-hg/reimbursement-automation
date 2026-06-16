@@ -17,8 +17,10 @@ const LOW_CONFIDENCE_THRESHOLD = 55;
 
 // ── Tesseract worker pool ─────────────────────────────────────────────────────
 // Multiple workers so OCR runs in parallel across CPU cores.
+// In memory-constrained environments (Railway, etc.) reduce via OCR_WORKERS=1.
+// Each worker loads ~25MB of WASM + language data, so 4 workers ≈ 100MB resident.
 
-const POOL_SIZE = 4;
+const POOL_SIZE = parseInt(process.env.OCR_WORKERS || '4', 10);
 let _pool = null;
 let _poolBusy = null;
 let _poolQueue = [];
