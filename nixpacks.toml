@@ -1,0 +1,23 @@
+[phases.setup]
+nixPkgs = [
+  "nodejs_20",
+  "chromium",          # system Chromium for Puppeteer
+  "nss",               # Chrome SSL/TLS
+  "freetype",
+  "harfbuzz",
+  "glib",
+  "fontconfig",
+]
+
+[phases.install]
+# Skip Puppeteer's bundled Chromium download — we use the system one from Nix above
+cmds = [
+  "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true npm ci",
+  "cd web && npm ci",
+]
+
+[phases.build]
+cmds = ["cd web && npm run build"]
+
+[start]
+cmd = "node src/server.js"

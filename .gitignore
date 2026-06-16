@@ -20,6 +20,9 @@ logs/
 # Build output
 web/dist/
 
+# Vite dev cache
+web/.vite/
+
 # macOS
 .DS_Store
 **/.DS_Store

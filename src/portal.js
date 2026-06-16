@@ -1,10 +1,20 @@
 require('dotenv').config();
 const puppeteer = require('puppeteer');
+const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const logger = require('./logger');
 const { resolveConfig } = require('./config');
+
+// Resolve Chromium executable: explicit env var → system binary (nixpacks/Railway) → Puppeteer bundled.
+function getChromiumExecutable() {
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) return process.env.PUPPETEER_EXECUTABLE_PATH;
+  for (const bin of ['chromium', 'chromium-browser', 'google-chrome-stable', 'google-chrome']) {
+    try { return execSync(`which ${bin}`, { encoding: 'utf8' }).trim(); } catch {}
+  }
+  return undefined; // fall back to Puppeteer's bundled Chromium
+}
 
 const PORTAL_URL = 'https://mypayroll2.myndsolution.com/Login.aspx?cid=REAINDIA';
 
@@ -63,6 +73,7 @@ async function submitReimbursementClaims(bills, {
   progress('launch', 'Launching browser');
   const browser = await puppeteer.launch({
     headless: cfg.HEADLESS,
+    executablePath: getChromiumExecutable(),
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     defaultViewport: { width: 1280, height: 800 },
   });

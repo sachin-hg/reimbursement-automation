@@ -4,7 +4,8 @@
   "description": "Automated petrol bill reimbursement: IMAP IDLE trigger → Claude Vision OCR → Puppeteer portal",
   "main": "src/cli.js",
   "scripts": {
-    "start": "node src/cli.js",
+    "start": "node src/server.js",
+    "build": "cd web && npm install && npm run build",
     "server": "node src/server.js",
     "web:dev": "cd web && npm run dev",
     "web:build": "cd web && npm run build",
