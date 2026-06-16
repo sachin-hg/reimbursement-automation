@@ -4,13 +4,18 @@ function storedConfig() {
   try { return JSON.parse(localStorage.getItem('reimbursement_config') || '{}'); } catch { return {}; }
 }
 
+// Backend base URL — set VITE_API_URL in Vercel (or .env.local) when the frontend
+// and backend are on different domains. Empty string = same origin (dev proxy / self-hosted).
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 // Module-level runId — set by App when a run is started or activated.
 // Auto-included in all run-scoped API calls so callers don't have to pass it every time.
 let _runId = null;
 
 async function call(method, path, body) {
-  const res = await fetch(path, {
+  const res = await fetch(API_BASE + path, {
     method,
+    credentials: 'include',   // needed for cross-origin cookie (session token)
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -22,6 +27,9 @@ async function call(method, path, body) {
 export const api = {
   // Set by App whenever runId state changes — keeps all subsequent calls scoped to this run.
   setRunId: (id) => { _runId = id; },
+
+  // Expose API_BASE so useSSE can build the correct EventSource URL.
+  base: API_BASE,
 
   status:    () => _runId ? call('GET', `/api/status?runId=${encodeURIComponent(_runId)}`) : call('GET', '/api/status'),
   getConfig: () => call('GET', '/api/config'),
@@ -36,7 +44,7 @@ export const api = {
   upload: async (files) => {
     const form = new FormData();
     for (const file of files) form.append('images', file);
-    const res = await fetch('/api/upload', { method: 'POST', body: form });
+    const res = await fetch(API_BASE + '/api/upload', { method: 'POST', body: form, credentials: 'include' });
     const json = await res.json();
     if (!res.ok) throw new Error(json.error || `HTTP ${res.status}`);
     return json;

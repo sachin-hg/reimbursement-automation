@@ -31,6 +31,12 @@ const IMAGE_EXTS    = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp',
 
 const TEN_YEARS_MS = 315360000000;
 
+// CORS — comma-separated list of allowed origins (e.g. https://myapp.vercel.app).
+// Leave unset for same-origin / local dev where the Vite proxy handles routing.
+const CORS_ORIGINS = new Set(
+  (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
+);
+
 function parseCookies(req) {
   const out = {};
   for (const part of (req.headers.cookie || '').split(';')) {
@@ -43,18 +49,24 @@ function parseCookies(req) {
   return out;
 }
 
+// When cross-origin CORS is active, cookies need SameSite=None; Secure so the browser
+// sends them with credentialed cross-origin requests.
+const isCrossOrigin = CORS_ORIGINS.size > 0;
+const COOKIE_OPTS = {
+  maxAge:   TEN_YEARS_MS,
+  httpOnly: false,   // JS-readable so the UI can display / copy it
+  sameSite: isCrossOrigin ? 'None' : 'Strict',
+  secure:   isCrossOrigin,   // SameSite=None requires Secure
+  path:     '/',
+};
+
 // Returns the caller's token, creating + setting a cookie if this is their first visit.
 // Must be called before res.json() / res.send() so the Set-Cookie header makes it out.
 function getToken(req, res) {
   const cookies = parseCookies(req);
   if (cookies.userToken) return cookies.userToken;
   const token = crypto.randomUUID();
-  res.cookie('userToken', token, {
-    maxAge: TEN_YEARS_MS,
-    httpOnly: false,   // JS-readable so the UI can display / copy it
-    sameSite: 'Strict',
-    path: '/',
-  });
+  res.cookie('userToken', token, COOKIE_OPTS);
   return token;
 }
 
@@ -89,6 +101,22 @@ function getRun(runId, res) {
   const run = activeRuns.get(runId);
   if (!run) { res.status(400).json({ error: 'Run not active — start or activate a run first' }); return null; }
   return run;
+}
+
+// CORS — only active when CORS_ORIGINS is configured (cross-origin / Vercel deployments).
+if (isCrossOrigin) {
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && CORS_ORIGINS.has(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      res.setHeader('Vary', 'Origin');
+    }
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+  });
 }
 
 app.use(express.json({ limit: '10mb' }));
@@ -235,7 +263,7 @@ app.get('/api/token', (req, res) => {
 // Generate a brand-new token — caller loses access to old runs unless they saved their token.
 app.post('/api/token/new', (req, res) => {
   const token = crypto.randomUUID();
-  res.cookie('userToken', token, { maxAge: TEN_YEARS_MS, httpOnly: false, sameSite: 'Strict', path: '/' });
+  res.cookie('userToken', token, COOKIE_OPTS);
   res.json({ token });
 });
 
@@ -245,7 +273,7 @@ app.post('/api/token/restore', (req, res) => {
   if (!token || typeof token !== 'string' || !token.trim())
     return res.status(400).json({ error: 'token is required' });
   const t = token.trim();
-  res.cookie('userToken', t, { maxAge: TEN_YEARS_MS, httpOnly: false, sameSite: 'Strict', path: '/' });
+  res.cookie('userToken', t, COOKIE_OPTS);
   res.json({ token: t });
 });
 
@@ -797,10 +825,16 @@ app.use((req, res) => {
   else res.status(404).send('Web app not built yet. Run: cd web && npm run build');
 });
 
-app.listen(PORT, () => {
-  logger.info(`Server → http://localhost:${PORT}`);
+if (require.main === module) {
+  app.listen(PORT, () => {
+    logger.info(`Server → http://localhost:${PORT}`);
+    migrateOldRuns();
+  });
+} else {
   migrateOldRuns();
-});
+}
+
+module.exports = app;
 
 // Backfill meta.json for run directories created before persistence was added.
 function migrateOldRuns() {

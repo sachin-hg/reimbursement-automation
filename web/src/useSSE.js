@@ -1,14 +1,18 @@
 import { useEffect, useRef } from 'react';
+import { api } from './api.js';
 
 export function useSSE(runId, handlers) {
   const handlersRef = useRef(handlers);
   handlersRef.current = handlers;
 
   useEffect(() => {
+    const base = api.base;
     const url = runId
-      ? `/api/events?runId=${encodeURIComponent(runId)}`
-      : '/api/events';
-    const es = new EventSource(url);
+      ? `${base}/api/events?runId=${encodeURIComponent(runId)}`
+      : `${base}/api/events`;
+
+    // withCredentials: true sends the session cookie cross-origin
+    const es = new EventSource(url, { withCredentials: true });
 
     es.onmessage = (e) => {
       try {

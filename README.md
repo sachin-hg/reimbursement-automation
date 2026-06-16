@@ -405,6 +405,49 @@ In the **Web UI**, toggle between modes using the **Extract via: OCR / LLM Visio
 
 ---
 
+## Deploying to Vercel + Railway
+
+The frontend is a perfect fit for Vercel (static SPA). The backend must run on a **persistent server** (Railway, Render, Fly.io, or self-hosted) because portal submission uses a long-lived Puppeteer session and SSE streams — these cannot run inside serverless functions.
+
+### Step 1 — Deploy the backend (Railway)
+
+1. Push the repo to GitHub.
+2. Create a new Railway project → **Deploy from GitHub repo**.
+3. Set environment variables in Railway's dashboard (all the `.env` values, plus):
+   ```
+   NODE_ENV=production
+   CORS_ORIGINS=https://your-app.vercel.app
+   PORT=3333
+   ```
+4. Railway uses the `Procfile` (`node src/server.js`) automatically. Note the deployed URL, e.g. `https://your-app.up.railway.app`.
+
+### Step 2 — Deploy the frontend (Vercel)
+
+1. Import the same GitHub repo in Vercel.
+2. Set the **Root Directory** to blank (repo root) — Vercel uses `vercel.json` to find the build.
+3. Add one environment variable in Vercel's dashboard:
+   ```
+   VITE_API_URL=https://your-app.up.railway.app
+   ```
+4. Deploy. Vercel runs `cd web && npm install && npm run build` and serves `web/dist`.
+
+### How it works
+
+- The Vite build bakes `VITE_API_URL` into the JS bundle at build time — all API calls go directly to the Railway backend.
+- The backend's `CORS_ORIGINS` setting allows the Vercel origin and sets `SameSite=None; Secure` on the session cookie so it works cross-origin.
+- SSE connections (`/api/events`) go directly to Railway — no Vercel timeout applies.
+
+### Local dev (unchanged)
+
+```bash
+npm run server    # backend on :3333
+npm run web:dev   # Vite on :5180, proxies /api and /files to :3333
+```
+
+No `VITE_API_URL` needed locally — the Vite proxy handles routing.
+
+---
+
 ## Privacy
 
 - **Credentials are never stored on the server.** Portal username/password are sent only during an active submit call and used exclusively to drive the browser session. They are not logged or persisted.
